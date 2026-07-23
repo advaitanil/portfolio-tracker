@@ -2,7 +2,12 @@
 .env
 .dev.vars
 worker/.dev.vars
-public/config.js
+
+# NOTE: public/config.js is intentionally NOT gitignored. It only holds the
+# Supabase anon/publishable key, which is safe to expose in browser code by
+# design (Row Level Security is what actually protects the data). It needs
+# to be committed so Cloudflare Pages deploys it. Never put the
+# service_role key here — that one stays a Worker secret only.
 
 node_modules/
 .wrangler/
