@@ -1,0 +1,83 @@
+:root {
+  --bg: #0f1115;
+  --panel: #171a21;
+  --border: #2a2e3a;
+  --text: #e8e9ed;
+  --muted: #9aa0ac;
+  --green: #3ddc97;
+  --red: #ff6b6b;
+  --accent: #5b8cff;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 24px 16px 64px;
+}
+header { margin-bottom: 16px; }
+h1 { margin: 0 0 4px; font-size: 1.6rem; }
+.asof { color: var(--muted); font-size: 0.85rem; margin: 0; }
+
+.summary {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin: 20px 0;
+}
+.stat {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 18px;
+  flex: 1;
+  min-width: 160px;
+}
+.stat .label { display: block; color: var(--muted); font-size: 0.8rem; }
+.stat .value { display: block; font-size: 1.4rem; font-weight: 600; margin-top: 4px; }
+.positive { color: var(--green); }
+.negative { color: var(--red); }
+
+section { margin: 28px 0; }
+h2 { font-size: 1.1rem; border-bottom: 1px solid var(--border); padding-bottom: 8px; }
+h3 { font-size: 0.9rem; color: var(--muted); }
+
+.allocation-grid { display: flex; gap: 40px; flex-wrap: wrap; }
+.allocation-grid ul { list-style: none; padding: 0; margin: 0; }
+.allocation-grid li { display: flex; justify-content: space-between; gap: 24px; padding: 4px 0; border-bottom: 1px dashed var(--border); min-width: 200px; }
+
+form { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+input, select, button {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 8px 10px;
+  border-radius: 6px;
+  font-size: 0.9rem;
+}
+button {
+  background: var(--accent);
+  border: none;
+  color: #0b0d12;
+  font-weight: 600;
+  cursor: pointer;
+}
+button:hover { opacity: 0.9; }
+.form-error { color: var(--red); font-size: 0.85rem; min-height: 1.2em; }
+
+table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+th { color: var(--muted); font-weight: 500; font-size: 0.8rem; text-transform: uppercase; }
+.stale { color: var(--red); font-size: 0.75rem; margin-left: 6px; }
+.del-btn { background: transparent; border: 1px solid var(--border); color: var(--muted); cursor: pointer; }
+.del-btn:hover { color: var(--red); border-color: var(--red); }
+
+footer { margin-top: 40px; color: var(--muted); font-size: 0.75rem; border-top: 1px solid var(--border); padding-top: 16px; }
+
+@media (max-width: 600px) {
+  form { flex-direction: column; align-items: stretch; }
+  table { font-size: 0.78rem; }
+  th:nth-child(9), td:nth-child(9) { display: none; } /* hide "as of" col on phones */
+}

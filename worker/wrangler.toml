@@ -1,0 +1,16 @@
+name = "portfolio-tracker-worker"
+main = "src/index.js"
+compatibility_date = "2024-09-23"
+
+# Cron runs in UTC — convert from your local time (Day 5).
+# Example below is 07:00 UTC daily; adjust to land in the recipient's morning.
+[triggers]
+crons = ["0 7 * * *"]
+
+# Non-secret config can live here. SECRETS (API keys) must NOT go in this file —
+# set them with `wrangler secret put <NAME>` instead (see README).
+[vars]
+BASE_CURRENCY = "USD"
+CLAUDE_MODEL = "claude-haiku-4-5-20251001"
+EMAIL_FROM = "portfolio@yourdomain.com"
+EMAIL_TO = "you@example.com"

@@ -1,0 +1,10 @@
+# Never commit secrets — this is a hard rule of the assignment (Section 5/13).
+.env
+.dev.vars
+worker/.dev.vars
+public/config.js
+
+node_modules/
+.wrangler/
+.DS_Store
+*.log
