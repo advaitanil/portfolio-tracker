@@ -188,8 +188,26 @@ document.getElementById("holdingForm").addEventListener("submit", async (e) => {
     return;
   }
   e.target.reset();
-  loadHoldings();
+  loadHoldings(); // show the new row immediately (price will say "no data" until the refresh below lands)
+  await triggerPriceRefresh();
+  loadHoldings(); // reload once the Worker has cached a price for the new ticker
 });
+
+// Ask the Worker to fetch+cache a price for anything missing (like a
+// just-added holding) without waiting for tomorrow's scheduled run. This is
+// a cache-only refresh — no email gets sent — and the Worker throttles it
+// server-side so repeated clicks don't burn through the market-data rate limit.
+async function triggerPriceRefresh() {
+  if (!window.WORKER_URL) return;
+  try {
+    const res = await fetch(`${window.WORKER_URL}/refresh-prices`);
+    const result = await res.json();
+    if (result.skipped) console.log("Price refresh skipped:", result.reason);
+    if (result.error) console.warn("Price refresh failed:", result.error);
+  } catch (err) {
+    console.warn("Could not reach the Worker to refresh prices:", err.message);
+  }
+}
 
 loadHoldings();
 setInterval(loadHoldings, 5 * 60 * 1000); // refresh the view every 5 min from cache (not the API)

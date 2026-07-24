@@ -18,6 +18,17 @@ import { fetchNews, prioritizeNews } from "./lib/news.js";
 import { writeCommentary } from "./lib/commentary.js";
 import { renderEmail, buildSubject, sendEmail } from "./lib/email.js";
 
+// CORS: the front end (a different origin, *.pages.dev) calls /refresh-prices
+// directly from the browser. Single-user internal demo, so wide open is fine
+// (see README "known limitations" re: no auth) — do not do this for anything
+// with real data or multiple users.
+const CORS_HEADERS = { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, OPTIONS" };
+
+// Don't let rapid front-end calls (e.g. mis-clicks, multiple tabs) burn
+// through Twelve Data's rate limit — skip refetching if we refreshed the
+// cache more recently than this, and just tell the caller so.
+const REFRESH_THROTTLE_MS = 2 * 60 * 1000; // 2 minutes
+
 export default {
   async scheduled(event, env, ctx) {
     ctx.waitUntil(runDailyJob(env));
@@ -28,6 +39,8 @@ export default {
   // few runs (Day 13's "visible log of recent runs").
   async fetch(req, env) {
     const url = new URL(req.url);
+    if (req.method === "OPTIONS") return new Response(null, { headers: CORS_HEADERS });
+
     if (url.pathname === "/run") {
       const result = await runDailyJob(env);
       return Response.json(result);
@@ -37,9 +50,61 @@ export default {
       const reports = await sb.getRecentReports(10).catch((e) => ({ error: e.message }));
       return Response.json(reports);
     }
-    return new Response("Portfolio Tracker Worker. Try /run or /status.", { status: 200 });
+    if (url.pathname === "/refresh-prices") {
+      const result = await refreshPricesOnly(env);
+      return Response.json(result, { headers: CORS_HEADERS });
+    }
+    return new Response("Portfolio Tracker Worker. Try /run, /status, or /refresh-prices.", { status: 200 });
   },
 };
+
+// Cache-only refresh — no email, no daily_reports row. This is what the front
+// end calls right after you add a holding, so you're not stuck waiting for
+// tomorrow's cron just to see a price for something you just added. Still
+// respects "cache prices, don't hit the API on every page load" — it's
+// triggered by a real user action, not polling, and throttled below.
+async function refreshPricesOnly(env) {
+  const baseCurrency = env.BASE_CURRENCY || "USD";
+  const sb = makeSupabase(env);
+
+  try {
+    const holdings = await sb.getHoldings();
+    if (!holdings.length) return { skipped: true, reason: "no holdings yet" };
+
+    const lastAsOf = await sb.getMostRecentPriceAsOf().catch(() => null);
+    if (lastAsOf && Date.now() - new Date(lastAsOf).getTime() < REFRESH_THROTTLE_MS) {
+      return { skipped: true, reason: "refreshed recently, throttled" };
+    }
+
+    const tickers = holdings.map((h) => h.ticker);
+    const priceCurrenciesNeeded = [...new Set(holdings.map((h) => h.buy_currency))];
+    const priceResults = await fetchPrices(tickers, env);
+    const currenciesInPrices = Object.values(priceResults).map((p) => p.currency).filter(Boolean);
+    const allQuoteCurrencies = [...new Set([...priceCurrenciesNeeded, ...currenciesInPrices])];
+    const fxRatesToday = await fetchFxRates(baseCurrency, allQuoteCurrencies);
+
+    await sb.insertRows(
+      "prices",
+      tickers.map((t) => ({
+        ticker: t,
+        price: priceResults[t]?.price ?? null,
+        previous_close: priceResults[t]?.previous_close ?? null,
+        currency: priceResults[t]?.currency ?? null,
+        source: priceResults[t]?.source ?? "twelvedata",
+        is_stale: priceResults[t]?.is_stale ?? true,
+        error: priceResults[t]?.error ?? null,
+      }))
+    );
+    await sb.insertRows(
+      "fx_rates",
+      Object.entries(fxRatesToday).map(([quote, rate]) => ({ base: baseCurrency, quote, rate }))
+    );
+
+    return { refreshed: true, tickers };
+  } catch (err) {
+    return { refreshed: false, error: err.message };
+  }
+}
 
 async function runDailyJob(env) {
   const startedAt = Date.now();

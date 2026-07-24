@@ -23,9 +23,9 @@ create table if not exists holdings (
 create table if not exists prices (
   id              uuid primary key default gen_random_uuid(),
   ticker          text not null,
-  price           numeric not null,
+  price           numeric, -- nullable: an unsupported/delisted ticker still gets a row (via `error`), it just has no price
   previous_close  numeric,
-  currency        text not null,
+  currency        text,
   as_of           timestamptz not null default now(),
   source          text not null,
   is_stale        boolean not null default false,

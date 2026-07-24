@@ -17,7 +17,12 @@ export function makeSupabase(env) {
       const body = await res.text().catch(() => "");
       throw new Error(`Supabase ${opts.method || "GET"} ${path} failed: ${res.status} ${body}`);
     }
-    return res.status === 204 ? null : res.json();
+    // PostgREST with Prefer: return=minimal responds 201 with an EMPTY body
+    // (not always 204), so calling res.json() unconditionally throws
+    // "Unexpected end of JSON input" on a successful write. Guard for that.
+    if (res.status === 204) return null;
+    const text = await res.text();
+    return text ? JSON.parse(text) : null;
   }
 
   return {
@@ -35,5 +40,11 @@ export function makeSupabase(env) {
     },
 
     getRecentReports: async (limit = 10) => req(`/daily_reports?select=*&order=report_date.desc&limit=${limit}`),
+
+    // Used to throttle the front end's on-demand /refresh-prices calls.
+    getMostRecentPriceAsOf: async () => {
+      const rows = await req(`/prices?select=as_of&order=as_of.desc&limit=1`);
+      return rows[0]?.as_of ?? null;
+    },
   };
 }
