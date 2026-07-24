@@ -201,6 +201,10 @@ async function triggerPriceRefresh() {
   if (!window.WORKER_URL) return;
   try {
     const res = await fetch(`${window.WORKER_URL}/refresh-prices`);
+    if (!res.ok) {
+      console.warn(`Price refresh request failed: HTTP ${res.status} (check WORKER_URL in config.js is correct)`);
+      return;
+    }
     const result = await res.json();
     if (result.skipped) console.log("Price refresh skipped:", result.reason);
     if (result.error) console.warn("Price refresh failed:", result.error);
