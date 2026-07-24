@@ -10,6 +10,11 @@ const STALE_AFTER_MS = 1000 * 60 * 60 * 24; // flag a price as stale if older th
 
 const fmtMoney = (n) =>
   n == null || Number.isNaN(n) ? "—" : n.toLocaleString(undefined, { style: "currency", currency: BASE_CURRENCY, maximumFractionDigits: 2 });
+// Format in whatever currency the holding was actually bought in (e.g. the
+// "Buy Price" column), rather than converting to the base currency — this is
+// what the user typed in, so show it back to them as-is.
+const fmtMoneyIn = (n, currency) =>
+  n == null || Number.isNaN(n) ? "—" : n.toLocaleString(undefined, { style: "currency", currency: currency || BASE_CURRENCY, maximumFractionDigits: 2 });
 const fmtPct = (n) => (n == null || Number.isNaN(n) ? "—" : `${n >= 0 ? "+" : ""}${n.toFixed(2)}%`);
 const pctClass = (n) => (n == null || Number.isNaN(n) ? "" : n >= 0 ? "positive" : "negative");
 
@@ -70,11 +75,11 @@ async function loadHoldings() {
   const tbody = document.getElementById("holdingsBody");
   const { data: holdings, error } = await sb.from("holdings").select("*").order("created_at");
   if (error) {
-    tbody.innerHTML = `<tr><td colspan="10">Failed to load holdings: ${error.message}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="11">Failed to load holdings: ${error.message}</td></tr>`;
     return;
   }
   if (holdings.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="10">No holdings yet — add one below.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="11">No holdings yet — add one below.</td></tr>`;
     resetSummary();
     return;
   }
@@ -122,6 +127,7 @@ async function loadHoldings() {
       <td>${h.ticker}</td>
       <td>${h.asset_type}</td>
       <td>${h.quantity}</td>
+      <td>${fmtMoneyIn(h.buy_price, h.buy_currency)}</td>
       <td>${priceInBase != null ? fmtMoney(priceInBase) : "—"}${isStale ? '<span class="stale">stale</span>' : ""}</td>
       <td>${fmtMoney(currentValue)}</td>
       <td class="${pctClass(dayChangePct)}">${fmtPct(dayChangePct)}</td>
@@ -188,10 +194,21 @@ document.getElementById("holdingForm").addEventListener("submit", async (e) => {
     return;
   }
   e.target.reset();
+  setDateToToday(); // form.reset() clears the date field back to blank — refill it
   loadHoldings(); // show the new row immediately (price will say "no data" until the refresh below lands)
   await triggerPriceRefresh();
   loadHoldings(); // reload once the Worker has cached a price for the new ticker
 });
+
+// Default the buy-date field to today so adding a holding usually needs zero
+// typing in that field — click the calendar icon only if you bought it on a
+// different day. The "Today" button resets it back if you've changed it.
+function setDateToToday() {
+  const input = document.getElementById("buyDateInput");
+  if (input) input.value = new Date().toISOString().slice(0, 10);
+}
+document.getElementById("todayBtn").addEventListener("click", setDateToToday);
+setDateToToday();
 
 // Ask the Worker to fetch+cache a price for anything missing (like a
 // just-added holding) without waiting for tomorrow's scheduled run. This is

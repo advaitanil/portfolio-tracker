@@ -59,7 +59,8 @@
         <option value="JPY">JPY</option>
         <option value="INR">INR</option>
       </select>
-      <input name="buy_date" type="date" required />
+      <input name="buy_date" type="date" id="buyDateInput" required />
+      <button type="button" id="todayBtn">Today</button>
       <button type="submit">Add holding</button>
     </form>
     <p class="form-error" id="formError"></p>
@@ -70,12 +71,12 @@
     <table>
       <thead>
         <tr>
-          <th>Ticker</th><th>Type</th><th>Qty</th><th>Price</th><th>Value</th>
+          <th>Ticker</th><th>Type</th><th>Qty</th><th>Buy Price</th><th>Price</th><th>Value</th>
           <th>Day %</th><th>Gain/Loss %</th><th>Weight</th><th>As of</th><th></th>
         </tr>
       </thead>
       <tbody id="holdingsBody">
-        <tr><td colspan="10">Loading…</td></tr>
+        <tr><td colspan="11">Loading…</td></tr>
       </tbody>
     </table>
   </section>
