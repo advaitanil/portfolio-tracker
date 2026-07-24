@@ -13,4 +13,8 @@ crons = ["0 7 * * *"]
 BASE_CURRENCY = "USD"
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 EMAIL_FROM = "onboarding@resend.dev"
+# Multi-user: EMAIL_TO is NOT where daily portfolio emails go anymore — each
+# signed-up user gets their own email, looked up from their Supabase Auth
+# account. This address is only used for the ops/failure alert if the shared
+# stage of the job breaks (Day 13) — set it to your own inbox.
 EMAIL_TO = "rexorot64@gmail.com"

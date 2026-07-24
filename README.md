@@ -3,8 +3,33 @@
 A web app for entering a portfolio of stocks/ETFs/funds, tracking it live, and
 emailing a daily summary with metrics, news, and AI commentary.
 
-Built for the ThinkPlan internship assignment. Single user, no login, free
-tiers only, test data only — see Section 12 of the brief for constraints.
+Built for the ThinkPlan internship assignment. Free tiers only, test data
+only — see Section 12 of the brief for constraints.
+
+**Note on scope:** the brief (Section 2) explicitly agrees "single portfolio,
+no login, keep it simple." This build goes further than that on request: it's
+a full multi-user app — anyone can sign up and gets their own private
+portfolio, own daily email, own value-history chart. This is a significant,
+intentional deviation from the agreed scope, not an oversight — worth
+flagging clearly in your D1/D2 write-up so it reads as a documented trade-off
+rather than scope creep, especially since the simpler alternatives (no login,
+or login-but-still-one-shared-portfolio) were raised first.
+
+Architecturally: `holdings`, `daily_reports`, and `portfolio_value_history`
+are scoped per-user via RLS (`auth.uid() = user_id`) — one user can never see
+another's data. `prices` and `fx_rates` stay a **shared** cache across every
+user, since ticker prices/FX rates aren't user-owned data, and sharing them
+is what keeps the app inside the market-data provider's free-tier rate limit
+regardless of how many people sign up (Twelve Data doesn't care if 1 person
+or 50 people are looking at AAPL's price — it's one shared row either way).
+The scheduled Worker fetches that shared cache once per run, then loops
+through every signed-up user and sends each one their own separate email.
+
+**Known gap:** Resend's sandbox sender (`onboarding@resend.dev`) can only
+deliver to the email address the Resend *account* was created with. Other
+users' daily emails will fail gracefully (logged as a failed `daily_reports`
+row) rather than crash the run, but they won't actually land in those users'
+inboxes until a real domain is verified in Resend.
 
 ## Status
 
@@ -16,11 +41,15 @@ code as a strong first draft: read it, understand every line, and verify the
 maths before you trust it, exactly as the brief asks.
 
 **Not yet done / left for you:**
-- Actual account creation, key generation, and deployment (nobody else can do this — it needs your logins).
-- Live end-to-end testing (nothing here has touched a real Supabase project, real API keys, or a real inbox yet).
-- Charting portfolio value over time (Day 14 — the `daily_reports` history is already being written, so a chart is a front-end addition away; not built here).
 - The Day 11 Haiku-vs-Sonnet comparison — the code supports switching models via `CLAUDE_MODEL`, but only you running it twice can produce real quality/latency/cost numbers.
 - NAV/fund-specific handling beyond generic caching (Day 12) — funds that price once daily will just show yesterday's price with an older "as of" timestamp; no special-casing has been added, and the brief only asks you to *document* this behaviour, not necessarily change it.
+- A sign-up flow — there's a sign-**in** form only. Create your one user manually in the Supabase dashboard (Authentication → Users → Add user) rather than through the app.
+
+**Since built:**
+- The Claude API key is optional — if `ANTHROPIC_API_KEY` isn't set, the email just omits the commentary section rather than failing.
+- A "Portfolio Value Over Time" chart, backfilled from **real** historical closing prices (Twelve Data `time_series`) and historical FX rates (Frankfurter's date-range endpoint) since each holding's `buy_date` — not synthetic data. Run it once via the Worker's `/backfill-history` endpoint; after that, the daily job appends one new real data point per day on its own.
+- An on-demand price refresh: adding a holding on the dashboard triggers the Worker's `/refresh-prices` endpoint immediately (throttled server-side), so you don't have to wait for the next scheduled run to see a price for something you just added.
+- A login gate via Supabase Auth (see the scope note above).
 
 ## Architecture
 
@@ -33,11 +62,13 @@ public/            Front end — static HTML/CSS/JS, deployed to Cloudflare Page
 
 worker/             Backend — Cloudflare Worker with a Cron Trigger
   wrangler.toml     Worker config + cron schedule (UTC!)
-  src/index.js      Scheduled handler: orchestrates the whole daily job
+  src/index.js      Routes: scheduled job, /run, /status, /refresh-prices, /backfill-history
   src/lib/
     supabase.js      Minimal PostgREST client (service_role key, bypasses RLS)
     prices.js         Twelve Data — batched quote fetch
     fx.js             Frankfurter — FX rates
+    history.js        Twelve Data time_series + Frankfurter historical range —
+                       real historical portfolio-value backfill for the chart
     metrics.js        All the maths: value, cost, gain/loss, weight, day change,
                        price return vs FX return
     news.js           Marketaux — fetch, dedupe, prioritise by biggest movers
@@ -45,7 +76,7 @@ worker/             Backend — Cloudflare Worker with a Cron Trigger
     email.js          Render the HTML email + send via Resend
     retry.js          Shared exponential-backoff helper
 
-schema.sql          Run once in the Supabase SQL editor — creates all 4 tables + RLS + seed data
+schema.sql          Run once in the Supabase SQL editor — creates all 5 tables + RLS + seed data
 ```
 
 ### End-to-end flow
@@ -67,6 +98,13 @@ schema.sql          Run once in the Supabase SQL editor — creates all 4 tables
 
 Do this in order. Estimated total: a few hours if everything goes smoothly,
 more if a provider's sign-up flow fights you — budget accordingly.
+
+**Migration note:** `schema.sql` is written for a fresh Supabase project. If
+your database already had holdings/reports/history from before multi-user
+support was added, those tables needed `user_id` added via `alter table`,
+existing rows backfilled to a real user, and RLS policies swapped from
+"any authenticated user" to "only this row's owner" — a one-time migration,
+not something `schema.sql` re-running would do for you on an existing table.
 
 ### 1. Accounts (Section 3 of the brief)
 

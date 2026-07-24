@@ -7,84 +7,110 @@
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-  <header>
+  <!-- Login gate: this project's brief (Section 2) explicitly says "single
+       portfolio, no login, keep it simple" — this gate is an intentional
+       deviation from that, added on request. See README for the note. -->
+  <section class="login-section" id="loginSection">
     <h1>Portfolio Tracker</h1>
-    <p class="asof" id="asOfLabel">Prices as of: —</p>
-  </header>
-
-  <section class="summary" id="summary">
-    <div class="stat">
-      <span class="label">Total value</span>
-      <span class="value" id="totalValue">—</span>
-    </div>
-    <div class="stat">
-      <span class="label">Day change</span>
-      <span class="value" id="dayChange">—</span>
-    </div>
-    <div class="stat">
-      <span class="label">Unrealised gain/loss</span>
-      <span class="value" id="totalGain">—</span>
-    </div>
-  </section>
-
-  <section class="allocation" id="allocationSection">
-    <h2>Allocation</h2>
-    <div class="allocation-grid">
-      <div>
-        <h3>By asset type</h3>
-        <ul id="allocByType"></ul>
+    <form id="loginForm">
+      <input name="email" type="email" placeholder="Email" required autocomplete="username" />
+      <input name="password" type="password" placeholder="Password" required autocomplete="current-password" minlength="6" />
+      <div class="login-actions">
+        <button type="submit" name="action" value="signin">Sign in</button>
+        <button type="submit" name="action" value="signup">Sign up</button>
       </div>
-      <div>
-        <h3>By currency</h3>
-        <ul id="allocByCurrency"></ul>
-      </div>
-    </div>
-  </section>
-
-  <section class="add-holding">
-    <h2>Add a holding</h2>
-    <form id="holdingForm">
-      <input name="ticker" placeholder="Ticker (e.g. AAPL)" required maxlength="10" />
-      <select name="asset_type" required>
-        <option value="stock">Stock</option>
-        <option value="etf">ETF</option>
-        <option value="fund">Fund</option>
-      </select>
-      <input name="quantity" type="number" step="any" min="0.000001" placeholder="Quantity" required />
-      <input name="buy_price" type="number" step="any" min="0.000001" placeholder="Buy price" required />
-      <select name="buy_currency" required>
-        <option value="USD">USD</option>
-        <option value="EUR">EUR</option>
-        <option value="GBP">GBP</option>
-        <option value="JPY">JPY</option>
-        <option value="INR">INR</option>
-      </select>
-      <input name="buy_date" type="date" id="buyDateInput" required />
-      <button type="button" id="todayBtn">Today</button>
-      <button type="submit">Add holding</button>
     </form>
-    <p class="form-error" id="formError"></p>
+    <p class="form-error" id="loginError"></p>
+    <p class="login-hint" id="loginHint"></p>
   </section>
 
-  <section class="holdings">
-    <h2>Holdings</h2>
-    <table>
-      <thead>
-        <tr>
-          <th>Ticker</th><th>Type</th><th>Qty</th><th>Buy Price</th><th>Price</th><th>Value</th>
-          <th>Day %</th><th>Gain/Loss %</th><th>Weight</th><th>As of</th><th></th>
-        </tr>
-      </thead>
-      <tbody id="holdingsBody">
-        <tr><td colspan="11">Loading…</td></tr>
-      </tbody>
-    </table>
-  </section>
+  <div id="appContent" style="display: none">
+    <header>
+      <h1>Portfolio Tracker</h1>
+      <p class="asof" id="asOfLabel">Prices as of: —</p>
+      <button type="button" id="signOutBtn" class="del-btn">Sign out</button>
+    </header>
 
-  <footer>
-    <p>Internal demo tool for informational purposes only. Not investment advice.
-      Data may be delayed, cached, or inaccurate. Values shown in <span id="baseCcyLabel">USD</span>.</p>
-  </footer>
+    <section class="summary" id="summary">
+      <div class="stat">
+        <span class="label">Total value</span>
+        <span class="value" id="totalValue">—</span>
+      </div>
+      <div class="stat">
+        <span class="label">Day change</span>
+        <span class="value" id="dayChange">—</span>
+      </div>
+      <div class="stat">
+        <span class="label">Unrealised gain/loss</span>
+        <span class="value" id="totalGain">—</span>
+      </div>
+    </section>
+
+    <section class="chart-section" id="chartSection">
+      <h2>Portfolio Value Over Time</h2>
+      <svg id="valueChart" viewBox="0 0 700 220" preserveAspectRatio="none"></svg>
+      <p class="chart-caption" id="chartCaption">No history yet — run a backfill or check back after a few scheduled runs.</p>
+    </section>
+
+    <section class="allocation" id="allocationSection">
+      <h2>Allocation</h2>
+      <div class="allocation-grid">
+        <div>
+          <h3>By asset type</h3>
+          <ul id="allocByType"></ul>
+        </div>
+        <div>
+          <h3>By currency</h3>
+          <ul id="allocByCurrency"></ul>
+        </div>
+      </div>
+    </section>
+
+    <section class="add-holding">
+      <h2>Add a holding</h2>
+      <form id="holdingForm">
+        <input name="ticker" placeholder="Ticker (e.g. AAPL)" required maxlength="10" />
+        <select name="asset_type" required>
+          <option value="stock">Stock</option>
+          <option value="etf">ETF</option>
+          <option value="fund">Fund</option>
+        </select>
+        <input name="quantity" type="number" step="any" min="0.000001" placeholder="Quantity" required />
+        <input name="buy_price" type="number" step="any" min="0.000001" placeholder="Buy price" required />
+        <select name="buy_currency" required>
+          <option value="USD">USD</option>
+          <option value="EUR">EUR</option>
+          <option value="GBP">GBP</option>
+          <option value="JPY">JPY</option>
+          <option value="INR">INR</option>
+        </select>
+        <input name="buy_date" type="date" id="buyDateInput" required />
+        <button type="button" id="todayBtn">Today</button>
+        <button type="submit">Add holding</button>
+      </form>
+      <p class="form-error" id="formError"></p>
+    </section>
+
+    <section class="holdings">
+      <h2>Holdings</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Ticker</th><th>Type</th><th>Qty</th><th>Buy Price</th><th>Current Price</th><th>Value</th>
+            <th>Day %</th><th>Gain/Loss %</th><th>Weight</th><th></th>
+          </tr>
+        </thead>
+        <tbody id="holdingsBody">
+          <tr><td colspan="10">Loading…</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <footer>
+      <p>Internal demo tool for informational purposes only. Not investment advice.
+        Data may be delayed, cached, or inaccurate. Values shown in <span id="baseCcyLabel">USD</span>.</p>
+    </footer>
+  </div>
 
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <script src="config.js"></script>

@@ -75,11 +75,11 @@ async function loadHoldings() {
   const tbody = document.getElementById("holdingsBody");
   const { data: holdings, error } = await sb.from("holdings").select("*").order("created_at");
   if (error) {
-    tbody.innerHTML = `<tr><td colspan="11">Failed to load holdings: ${error.message}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="10">Failed to load holdings: ${error.message}</td></tr>`;
     return;
   }
   if (holdings.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="11">No holdings yet — add one below.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="10">No holdings yet — add one below.</td></tr>`;
     resetSummary();
     return;
   }
@@ -133,7 +133,6 @@ async function loadHoldings() {
       <td class="${pctClass(dayChangePct)}">${fmtPct(dayChangePct)}</td>
       <td class="${pctClass(gainPct)}">${fmtPct(gainPct)}</td>
       <td>${totalValue ? fmtPct((currentValue / totalValue) * 100).replace("+", "") : "—"}</td>
-      <td>${priceInBase != null ? "cached" : "no data"}</td>
       <td><button class="del-btn" data-id="${h.id}">Delete</button></td>
     </tr>`)
     .join("");
@@ -171,12 +170,72 @@ function resetSummary() {
   document.getElementById("totalGain").textContent = "—";
 }
 
+// Chart of real portfolio value over time — backfilled once from actual
+// historical closing prices since each holding's buy_date, then appended to
+// daily by the scheduled Worker. See worker/src/lib/history.js.
+async function loadValueHistory() {
+  const svg = document.getElementById("valueChart");
+  const caption = document.getElementById("chartCaption");
+  const { data, error } = await sb
+    .from("portfolio_value_history")
+    .select("date, total_value")
+    .order("date", { ascending: true });
+
+  if (error) {
+    svg.innerHTML = "";
+    caption.textContent = `Could not load history: ${error.message}`;
+    return;
+  }
+  if (!data || data.length === 0) {
+    svg.innerHTML = "";
+    caption.textContent = "No history yet — visit <WORKER_URL>/backfill-history once to seed it from real historical prices, or check back after a few scheduled runs.";
+    return;
+  }
+
+  renderValueChart(svg, data);
+  const first = data[0];
+  const last = data[data.length - 1];
+  caption.textContent = `${new Date(first.date).toLocaleDateString()} – ${new Date(last.date).toLocaleDateString()} · ${data.length} day${data.length === 1 ? "" : "s"} of history`;
+}
+
+function renderValueChart(svg, points) {
+  const width = 700;
+  const height = 220;
+  const padX = 10;
+  const padY = 20;
+
+  const values = points.map((p) => p.total_value);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const range = max - min || 1; // flat line (or single point): avoid divide-by-zero
+
+  const x = (i) => (points.length === 1 ? width / 2 : padX + (i * (width - 2 * padX)) / (points.length - 1));
+  const y = (v) => padY + (1 - (v - min) / range) * (height - 2 * padY);
+
+  const linePoints = points.map((p, i) => `${x(i).toFixed(1)},${y(p.total_value).toFixed(1)}`).join(" ");
+  const areaPoints = `${x(0).toFixed(1)},${(height - padY).toFixed(1)} ${linePoints} ${x(points.length - 1).toFixed(1)},${(height - padY).toFixed(1)}`;
+  const trendUp = values[values.length - 1] >= values[0];
+  const stroke = trendUp ? "#3ddc97" : "#ff6b6b";
+
+  svg.innerHTML = `
+    <polygon points="${areaPoints}" fill="${stroke}" fill-opacity="0.12" stroke="none"></polygon>
+    <polyline points="${linePoints}" fill="none" stroke="${stroke}" stroke-width="2"></polyline>
+    <text x="${padX}" y="14" fill="#9aa0ac" font-size="11">${fmtMoney(max)}</text>
+    <text x="${padX}" y="${height - 6}" fill="#9aa0ac" font-size="11">${fmtMoney(min)}</text>
+  `;
+}
+
 document.getElementById("holdingForm").addEventListener("submit", async (e) => {
   e.preventDefault();
   const errEl = document.getElementById("formError");
   errEl.textContent = "";
+  if (!currentUserId) {
+    errEl.textContent = "Not signed in — please sign in again.";
+    return;
+  }
   const form = new FormData(e.target);
   const payload = {
+    user_id: currentUserId, // required by RLS: with check (auth.uid() = user_id)
     ticker: form.get("ticker").trim().toUpperCase(),
     asset_type: form.get("asset_type"),
     quantity: Number(form.get("quantity")),
@@ -208,7 +267,6 @@ function setDateToToday() {
   if (input) input.value = new Date().toISOString().slice(0, 10);
 }
 document.getElementById("todayBtn").addEventListener("click", setDateToToday);
-setDateToToday();
 
 // Ask the Worker to fetch+cache a price for anything missing (like a
 // just-added holding) without waiting for tomorrow's scheduled run. This is
@@ -230,5 +288,82 @@ async function triggerPriceRefresh() {
   }
 }
 
-loadHoldings();
-setInterval(loadHoldings, 5 * 60 * 1000); // refresh the view every 5 min from cache (not the API)
+// --- Login gate ---
+// Intentional deviation from the assignment brief (Section 2: "single
+// portfolio, no login, keep it simple") — this is a full multi-user app now,
+// each person with their own portfolio, added on request. Real enforcement
+// happens via Supabase RLS policies scoped to auth.uid() = user_id (see
+// schema.sql), not just this UI toggle — the anon key is public, so a
+// client-side-only gate would be trivial to bypass otherwise.
+let currentUserId = null; // set from whichever auth call succeeds — never re-fetched separately
+
+function showApp(user) {
+  currentUserId = user.id;
+  document.getElementById("loginSection").style.display = "none";
+  document.getElementById("appContent").style.display = "";
+  setDateToToday();
+  loadHoldings();
+  loadValueHistory();
+  if (!window.__pollingStarted) {
+    window.__pollingStarted = true;
+    setInterval(() => {
+      loadHoldings();
+      loadValueHistory();
+    }, 5 * 60 * 1000); // refresh the view every 5 min from cache (not the API)
+  }
+}
+
+function showLogin() {
+  currentUserId = null;
+  document.getElementById("appContent").style.display = "none";
+  document.getElementById("loginSection").style.display = "";
+}
+
+document.getElementById("loginForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const errEl = document.getElementById("loginError");
+  const hintEl = document.getElementById("loginHint");
+  errEl.textContent = "";
+  hintEl.textContent = "";
+
+  const form = new FormData(e.target);
+  const email = form.get("email");
+  const password = form.get("password");
+  const action = e.submitter?.value || form.get("action"); // which button was clicked
+
+  if (action === "signup") {
+    const { data, error } = await sb.auth.signUp({ email, password });
+    if (error) {
+      errEl.textContent = error.message;
+      return;
+    }
+    if (data.session) {
+      // Email confirmation is off in this project's Auth settings — signed in right away.
+      showApp(data.user);
+    } else {
+      // Email confirmation is on — Supabase created the account but won't issue a
+      // session until the confirmation link is clicked.
+      hintEl.textContent = "Account created — check your email to confirm it, then sign in above.";
+    }
+    return;
+  }
+
+  const { data, error } = await sb.auth.signInWithPassword({ email, password });
+  if (error) {
+    errEl.textContent = error.message;
+    return;
+  }
+  showApp(data.user);
+});
+
+document.getElementById("signOutBtn").addEventListener("click", async () => {
+  await sb.auth.signOut();
+  showLogin();
+});
+
+// On load, pick up an existing session (Supabase persists it in
+// localStorage) so you're not asked to log in again on every visit.
+sb.auth.getSession().then(({ data: { session } }) => {
+  if (session) showApp(session.user);
+  else showLogin();
+});

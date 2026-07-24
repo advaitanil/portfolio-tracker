@@ -26,7 +26,20 @@ export function makeSupabase(env) {
   }
 
   return {
+    // Every holding, across every user — the Worker uses the service_role
+    // key so this bypasses RLS entirely. Per-user filtering happens in JS
+    // (see index.js), not here, so the shared price/FX refresh can work off
+    // the union of everyone's tickers in a single pass.
     getHoldings: () => req("/holdings?select=*&order=created_at.asc"),
+
+    // GoTrue admin endpoint (not PostgREST) — lists every signed-up user so
+    // the daily job knows who to email. Same service_role key works here too.
+    listUsers: async () => {
+      const res = await fetch(`${env.SUPABASE_URL}/auth/v1/admin/users`, { headers: authHeaders });
+      if (!res.ok) throw new Error(`Supabase admin listUsers failed: ${res.status} ${await res.text().catch(() => "")}`);
+      const json = await res.json();
+      return json.users || [];
+    },
 
     insertRows: (table, rows) =>
       req(`/${table}`, { method: "POST", headers: { Prefer: "return=minimal" }, body: JSON.stringify(rows) }),
@@ -39,12 +52,23 @@ export function makeSupabase(env) {
       return rows[0]?.rate ?? null;
     },
 
-    getRecentReports: async (limit = 10) => req(`/daily_reports?select=*&order=report_date.desc&limit=${limit}`),
+    getRecentReports: async (limit = 10, userId) =>
+      req(`/daily_reports?select=*&user_id=eq.${userId}&order=report_date.desc&limit=${limit}`),
 
     // Used to throttle the front end's on-demand /refresh-prices calls.
     getMostRecentPriceAsOf: async () => {
       const rows = await req(`/prices?select=as_of&order=as_of.desc&limit=1`);
       return rows[0]?.as_of ?? null;
     },
+
+    // Insert-or-replace by unique column — used for portfolio_value_history,
+    // which has exactly one row per date (unlike prices/fx_rates, which
+    // append). `conflictCol` must have a unique index (see schema.sql).
+    upsertRows: (table, rows, conflictCol) =>
+      req(`/${table}?on_conflict=${conflictCol}`, {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify(rows),
+      }),
   };
 }

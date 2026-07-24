@@ -2,9 +2,11 @@
 -- Run this in the Supabase SQL editor (Project > SQL Editor > New query).
 
 -- ── holdings ────────────────────────────────────────────────────────────────
--- What you own. One row per manually-entered lot.
+-- What you own. One row per manually-entered lot. Multi-user: every holding
+-- belongs to exactly one Supabase Auth user (see RLS policies below).
 create table if not exists holdings (
   id           uuid primary key default gen_random_uuid(),
+  user_id      uuid not null references auth.users (id) on delete cascade,
   ticker       text not null,
   name         text,
   asset_type   text not null check (asset_type in ('stock', 'etf', 'fund')),
@@ -14,6 +16,7 @@ create table if not exists holdings (
   buy_date     date not null,
   created_at   timestamptz not null default now()
 );
+create index if not exists idx_holdings_user on holdings (user_id);
 
 -- ── prices ──────────────────────────────────────────────────────────────────
 -- Cached price snapshots. We APPEND a new row every refresh (never overwrite)
@@ -46,10 +49,13 @@ create table if not exists fx_rates (
 create index if not exists idx_fx_base_quote_asof on fx_rates (base, quote, as_of desc);
 
 -- ── daily_reports ───────────────────────────────────────────────────────────
--- One row per scheduled Worker run. This is both the audit trail (Day 13's
--- "visible log of recent runs") and the record of what each email contained.
+-- One row per (user, scheduled Worker run) — the Worker loops through every
+-- signed-up user each run and emails each one separately. This is both the
+-- audit trail (Day 13's "visible log of recent runs") and the record of what
+-- each user's email contained.
 create table if not exists daily_reports (
   id             uuid primary key default gen_random_uuid(),
+  user_id        uuid not null references auth.users (id) on delete cascade,
   report_date    date not null default current_date,
   total_value    numeric,
   day_change_pct numeric,
@@ -60,29 +66,52 @@ create table if not exists daily_reports (
   error          text,
   sent_at        timestamptz
 );
-create index if not exists idx_daily_reports_date on daily_reports (report_date desc);
+create index if not exists idx_daily_reports_user_date on daily_reports (user_id, report_date desc);
+
+-- ── portfolio_value_history ─────────────────────────────────────────────────
+-- One row per calendar day: total portfolio value in base currency. Seeded
+-- once via a real historical backfill (Twelve Data time_series + Frankfurter
+-- historical FX, since each holding's buy_date — see worker/src/lib/history.js),
+-- then appended to daily by the scheduled job going forward. Powers the
+-- "value over time" chart. Deliberately a separate table from daily_reports:
+-- daily_reports is an audit trail of actual Worker runs (Day 13); this table
+-- is purely valuation-over-time data and can be legitimately backfilled for
+-- dates before the Worker ever ran.
+create table if not exists portfolio_value_history (
+  id            uuid primary key default gen_random_uuid(),
+  user_id       uuid not null references auth.users (id) on delete cascade,
+  date          date not null,
+  total_value   numeric not null,
+  base_currency text not null,
+  source        text not null default 'backfill', -- 'backfill' | 'daily_job'
+  created_at    timestamptz not null default now()
+);
+create unique index if not exists idx_portfolio_value_history_user_date on portfolio_value_history (user_id, date);
 
 -- ── Row Level Security ──────────────────────────────────────────────────────
--- Single-user internal demo (Section 2: "no login"). We still enable RLS and
--- open it up explicitly rather than leaving tables unprotected — this is the
--- kind of thing worth a one-line note in the README under "known limitations":
--- a real multi-user version would scope every row to an authenticated user.
+-- NOTE: this project deviates here from the brief's agreed scope (Section 2:
+-- "single portfolio, no login, keep it simple") — it's a full multi-user app
+-- with each person's own portfolio, on request. An explicit, documented
+-- choice, not an oversight. holdings/daily_reports/portfolio_value_history
+-- are scoped per-user (auth.uid() = user_id) so one user can never see
+-- another's data. prices/fx_rates stay a SHARED cache across all users —
+-- ticker prices and FX rates aren't user-owned data, and sharing them is
+-- what keeps the whole app inside the market-data provider's free-tier rate
+-- limit regardless of how many people sign up. The Worker's service_role key
+-- always bypasses RLS entirely (it has to — it writes on behalf of every
+-- user in one run), so none of this affects the scheduled job itself.
 alter table holdings enable row level security;
 alter table prices enable row level security;
 alter table fx_rates enable row level security;
 alter table daily_reports enable row level security;
+alter table portfolio_value_history enable row level security;
 
-create policy "public read/write holdings" on holdings for all using (true) with check (true);
-create policy "public read/write prices" on prices for all using (true) with check (true);
-create policy "public read/write fx_rates" on fx_rates for all using (true) with check (true);
-create policy "public read/write daily_reports" on daily_reports for all using (true) with check (true);
+create policy "users manage own holdings" on holdings for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+create policy "authenticated read/write prices" on prices for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+create policy "authenticated read/write fx_rates" on fx_rates for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+create policy "users manage own daily_reports" on daily_reports for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+create policy "users manage own portfolio_value_history" on portfolio_value_history for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
 
--- ── Seed: 3 test holdings (Day 1 "done when") ───────────────────────────────
-insert into holdings (ticker, name, asset_type, quantity, buy_price, buy_currency, buy_date) values
-  ('AAPL', 'Apple Inc.',              'stock', 10, 180.00, 'USD', '2026-01-15'),
-  ('VOO',  'Vanguard S&P 500 ETF',    'etf',   5,  420.00, 'USD', '2026-02-01'),
-  ('VWCE', 'Vanguard FTSE All-World', 'fund',  8,   95.00, 'EUR', '2026-03-01')
-on conflict do nothing;
-
--- Verify with:
--- select * from holdings;
+-- No seed data here on purpose: holdings now require a real user_id, and
+-- there's no user until someone signs up through the app. Sign up, then add
+-- your first 3 test holdings through the dashboard form.
