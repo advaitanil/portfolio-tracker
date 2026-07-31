@@ -43,11 +43,27 @@ export function renderEmail(metrics, news, commentary) {
 
   return `<!doctype html>
 <html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Portfolio Tracker — Daily Summary</title>
+  <style>
+    /* Not all mail clients honour a <style> block, but the ones that do
+       (Apple Mail, most mobile clients) get a noticeably better small-screen
+       layout out of this — Day 14 "make the email readable on a phone". */
+    @media (max-width: 480px) {
+      .container { width: 100% !important; border-radius: 0 !important; }
+      .headline-value { font-size: 22px !important; }
+      .holdings-table { font-size: 11px !important; }
+      .holdings-table th, .holdings-table td { padding: 5px 3px !important; }
+    }
+  </style>
+</head>
 <body style="font-family:-apple-system,Helvetica,Arial,sans-serif;background:#f4f5f7;padding:16px;margin:0">
-  <div style="max-width:600px;margin:0 auto;background:#fff;border-radius:10px;overflow:hidden;border:1px solid #e5e7eb">
+  <div class="container" style="max-width:600px;margin:0 auto;background:#fff;border-radius:10px;overflow:hidden;border:1px solid #e5e7eb">
     <div style="padding:20px 24px;background:#111;color:#fff">
       <div style="font-size:13px;color:#aaa">Portfolio Tracker — Daily Summary</div>
-      <div style="font-size:26px;font-weight:700;margin-top:4px">${money(metrics.totalValue, ccy)}</div>
+      <div class="headline-value" style="font-size:26px;font-weight:700;margin-top:4px">${money(metrics.totalValue, ccy)}</div>
       <div style="font-size:15px;color:${headlineColor}">${arrow} ${pct(metrics.dayChangePct)} today · Gain/loss ${money(metrics.totalGainAbs, ccy)} (${pct(metrics.totalGainPct)})</div>
     </div>
     <div style="padding:20px 24px">
@@ -57,10 +73,13 @@ export function renderEmail(metrics, news, commentary) {
       </table>
 
       <h3 style="font-size:14px;color:#333;margin:20px 0 8px">Holdings</h3>
-      <table style="width:100%;font-size:12px;border-collapse:collapse">
-        <thead><tr style="color:#888;text-align:left;border-bottom:1px solid #eee"><th style="padding:4px">Ticker</th><th style="padding:4px">Qty</th><th style="padding:4px">Price</th><th style="padding:4px">Value</th><th style="padding:4px">Day %</th><th style="padding:4px">Gain %</th><th style="padding:4px">Wt</th></tr></thead>
-        <tbody>${rows}</tbody>
-      </table>
+      <div style="overflow-x:auto;-webkit-overflow-scrolling:touch">
+        <table class="holdings-table" style="width:100%;min-width:420px;font-size:12px;border-collapse:collapse">
+          <thead><tr style="color:#888;text-align:left;border-bottom:1px solid #eee"><th style="padding:4px">Ticker</th><th style="padding:4px">Qty</th><th style="padding:4px">Price</th><th style="padding:4px">Value</th><th style="padding:4px">Day %</th><th style="padding:4px">Gain %</th><th style="padding:4px">Wt</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+      <p style="font-size:10px;color:#aaa;margin:4px 0 0">Swipe to see more columns on a small screen.</p>
 
       <h3 style="font-size:14px;color:#333;margin:20px 0 8px">News</h3>
       <ul style="font-size:13px;padding-left:18px;margin:0">${newsHtml}</ul>

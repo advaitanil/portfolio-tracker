@@ -71,8 +71,10 @@ table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
 th { color: var(--muted); font-weight: 500; font-size: 0.8rem; text-transform: uppercase; }
 .stale { color: var(--red); font-size: 0.75rem; margin-left: 6px; }
-.del-btn { background: transparent; border: 1px solid var(--border); color: var(--muted); cursor: pointer; }
+.nav-tag { color: var(--muted); font-size: 0.7rem; margin-left: 6px; border: 1px solid var(--border); border-radius: 4px; padding: 1px 4px; }
+.del-btn, .edit-btn, #cancelEditBtn { background: transparent; border: 1px solid var(--border); color: var(--muted); cursor: pointer; font-weight: 500; }
 .del-btn:hover { color: var(--red); border-color: var(--red); }
+.edit-btn:hover { color: var(--accent); border-color: var(--accent); }
 
 footer { margin-top: 40px; color: var(--muted); font-size: 0.75rem; border-top: 1px solid var(--border); padding-top: 16px; }
 

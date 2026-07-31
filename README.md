@@ -33,23 +33,26 @@ inboxes until a real domain is verified in Resend.
 
 ## Status
 
-This repo contains a working implementation of the **Must** requirements
-(Section 11) plus most of the **Should** items, generated as a starting
-codebase. It has **not yet been deployed or run against real accounts** —
-that's the next step, and it's yours to do (see "Setup" below). Treat the
-code as a strong first draft: read it, understand every line, and verify the
-maths before you trust it, exactly as the brief asks.
+This is deployed and running, not just a starting codebase — live URL, live
+Worker, real Supabase project. Everything below is either fully built and
+testable, or is honestly flagged as something that needs your own real-world
+action (time passing, a working API key, an actual submission) rather than
+more code.
 
-**Not yet done / left for you:**
-- The Day 11 Haiku-vs-Sonnet comparison — the code supports switching models via `CLAUDE_MODEL`, but only you running it twice can produce real quality/latency/cost numbers.
-- NAV/fund-specific handling beyond generic caching (Day 12) — funds that price once daily will just show yesterday's price with an older "as of" timestamp; no special-casing has been added, and the brief only asks you to *document* this behaviour, not necessarily change it.
-- A sign-up flow — there's a sign-**in** form only. Create your one user manually in the Supabase dashboard (Authentication → Users → Add user) rather than through the app.
+**Built and working:**
+- All Section 11 **Must** items: holdings CRUD, cached prices with an "as of" timestamp, base-currency conversion, hand-verified value/gain/day-change, scheduled email, news, graceful degradation, no secrets in git.
+- Most **Should** items: retries/backoff, a failure alert on shared-stage errors, price return separated from FX return, a visible recent-runs log (now in the dashboard UI, not just the `/status` API).
+- Most **Could** items: value-over-time chart (from *real* historical closing prices, not synthetic data), allocation breakdown, edit-holding (not just delete), a mobile-readable email layout.
+- Beyond the brief: full login + multi-user support (see scope note above), an on-demand price refresh after adding a holding, NAV/fund holdings get a longer staleness grace period than intraday stocks and are labelled "NAV" rather than "price."
 
-**Since built:**
-- The Claude API key is optional — if `ANTHROPIC_API_KEY` isn't set, the email just omits the commentary section rather than failing.
-- A "Portfolio Value Over Time" chart, backfilled from **real** historical closing prices (Twelve Data `time_series`) and historical FX rates (Frankfurter's date-range endpoint) since each holding's `buy_date` — not synthetic data. Run it once via the Worker's `/backfill-history` endpoint; after that, the daily job appends one new real data point per day on its own.
-- An on-demand price refresh: adding a holding on the dashboard triggers the Worker's `/refresh-prices` endpoint immediately (throttled server-side), so you don't have to wait for the next scheduled run to see a price for something you just added.
-- A login gate via Supabase Auth (see the scope note above).
+**Genuinely NOT done — and not something more code fixes:**
+- **3 mornings of automated email** (Must, Section 11) — this requires the scheduled cron to fire unattended on 3 separate real calendar days. Nothing can shortcut this; check your inbox over the next few mornings.
+- **Claude commentary actually appearing in the email** (Must) — the code is fully built and guardrailed, but you hit a blocker getting Claude API access, so `ANTHROPIC_API_KEY` was never set. Until it is, every email correctly *omits* the commentary section (graceful degradation working as designed) rather than containing one. This needs to be resolved for that Must item to be genuinely met.
+- **The Day 11 Haiku-vs-Sonnet comparison** — blocked on the same Claude API access issue; can't produce real quality/latency/cost numbers without a working key.
+- **Wider ticker coverage beyond Twelve Data's free tier** — this is a paid-plan constraint, not a code gap; Section 12 requires written approval before spending, so this stays documented as a limitation rather than solved.
+- **D1/D2 submission, demo recording, and handover note** — these are real actions only you can take (sending to Divya, recording your screen), not code.
+
+If you're using this repo as evidence for D1/D2, the honest move is to call out these five items explicitly rather than let the amount of finished code imply they're covered too.
 
 ## Architecture
 
@@ -57,7 +60,9 @@ maths before you trust it, exactly as the brief asks.
 public/            Front end — static HTML/CSS/JS, deployed to Cloudflare Pages
   index.html        Page structure
   style.css         Styling (mobile-friendly)
-  app.js            Supabase client: holdings CRUD, reads from prices/fx cache only
+  app.js            Supabase client: holdings CRUD + edit, login/signup, reads
+                     from prices/fx/history caches only (never calls a
+                     market-data or FX API directly from the browser)
   config.example.js Copy to config.js and fill in your Supabase URL + anon key
 
 worker/             Backend — Cloudflare Worker with a Cron Trigger

@@ -6,7 +6,15 @@
 
 const sb = window.supabase.createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY);
 const BASE_CURRENCY = window.BASE_CURRENCY || "USD";
-const STALE_AFTER_MS = 1000 * 60 * 60 * 24; // flag a price as stale if older than 24h
+const STALE_AFTER_MS = 1000 * 60 * 60 * 24; // stocks/ETFs trade intraday — flag stale after 24h
+// Day 12: funds priced once/day (NAV) shouldn't be flagged stale on the same
+// clock as an intraday stock quote. A NAV struck yesterday afternoon is still
+// "today's price" from the fund's point of view, and a long weekend or a
+// market holiday can easily put 60+ hours between two genuine NAV strikes.
+// NOTE: Twelve Data's free tier doesn't expose true once-daily mutual-fund
+// NAV as a distinct endpoint — "fund" here still reads the same quote
+// endpoint as everything else, just interpreted with a more lenient clock.
+const FUND_STALE_AFTER_MS = 1000 * 60 * 60 * 84; // 3.5 days
 
 const fmtMoney = (n) =>
   n == null || Number.isNaN(n) ? "—" : n.toLocaleString(undefined, { style: "currency", currency: BASE_CURRENCY, maximumFractionDigits: 2 });
@@ -63,12 +71,14 @@ function computeRow(holding, priceRow, fxRates) {
     dayChangePct = ((priceRow.price - priceRow.previous_close) / priceRow.previous_close) * 100;
   }
 
+  const isFund = holding.asset_type === "fund";
+  const staleThreshold = isFund ? FUND_STALE_AFTER_MS : STALE_AFTER_MS;
   const isStale =
     !priceRow ||
     priceRow.is_stale ||
-    Date.now() - new Date(priceRow.as_of).getTime() > STALE_AFTER_MS;
+    Date.now() - new Date(priceRow.as_of).getTime() > staleThreshold;
 
-  return { currentValue, gainAbs, gainPct, dayChangePct, priceInBase, isStale, priceRow };
+  return { currentValue, gainAbs, gainPct, dayChangePct, priceInBase, isStale, isFund, priceRow };
 }
 
 async function loadHoldings() {
@@ -121,19 +131,26 @@ async function loadHoldings() {
 
   renderAllocation(rows, totalValue);
 
+  // Keep the raw holding rows around so the Edit button can look one up by id
+  // without a round trip — cheap since this is already the full list.
+  window.__holdingsById = Object.fromEntries(holdings.map((h) => [h.id, h]));
+
   tbody.innerHTML = rows
-    .map(({ h, currentValue, gainPct, dayChangePct, priceInBase, isStale }) => `
+    .map(({ h, currentValue, gainPct, dayChangePct, priceInBase, isStale, isFund }) => `
     <tr>
       <td>${h.ticker}</td>
       <td>${h.asset_type}</td>
       <td>${h.quantity}</td>
       <td>${fmtMoneyIn(h.buy_price, h.buy_currency)}</td>
-      <td>${priceInBase != null ? fmtMoney(priceInBase) : "—"}${isStale ? '<span class="stale">stale</span>' : ""}</td>
+      <td>${priceInBase != null ? fmtMoney(priceInBase) : "—"}${isFund ? '<span class="nav-tag">NAV</span>' : ""}${isStale ? '<span class="stale">stale</span>' : ""}</td>
       <td>${fmtMoney(currentValue)}</td>
       <td class="${pctClass(dayChangePct)}">${fmtPct(dayChangePct)}</td>
       <td class="${pctClass(gainPct)}">${fmtPct(gainPct)}</td>
       <td>${totalValue ? fmtPct((currentValue / totalValue) * 100).replace("+", "") : "—"}</td>
-      <td><button class="del-btn" data-id="${h.id}">Delete</button></td>
+      <td>
+        <button class="edit-btn" data-id="${h.id}">Edit</button>
+        <button class="del-btn" data-id="${h.id}">Delete</button>
+      </td>
     </tr>`)
     .join("");
 
@@ -143,6 +160,10 @@ async function loadHoldings() {
       await sb.from("holdings").delete().eq("id", btn.dataset.id);
       loadHoldings();
     })
+  );
+
+  tbody.querySelectorAll(".edit-btn").forEach((btn) =>
+    btn.addEventListener("click", () => startEdit(window.__holdingsById[btn.dataset.id]))
   );
 }
 
@@ -162,6 +183,40 @@ function renderAllocation(rows, totalValue) {
   };
   renderList(document.getElementById("allocByType"), byType);
   renderList(document.getElementById("allocByCurrency"), byCurrency);
+}
+
+// Day 13: "a visible log of recent runs (status, duration, errors)." The
+// Worker's /status endpoint already returns this; this just gives it a face
+// on the dashboard, scoped to the signed-in user's own runs via RLS.
+async function loadRecentRuns() {
+  const tbody = document.getElementById("recentRunsBody");
+  const { data, error } = await sb
+    .from("daily_reports")
+    .select("report_date, status, duration_ms, total_value, error")
+    .order("report_date", { ascending: false })
+    .limit(10);
+
+  if (error) {
+    tbody.innerHTML = `<tr><td colspan="5">Could not load run history: ${error.message}</td></tr>`;
+    return;
+  }
+  if (!data || data.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="5">No runs yet — the scheduled Worker hasn't run for this account.</td></tr>`;
+    return;
+  }
+
+  tbody.innerHTML = data
+    .map(
+      (r) => `
+    <tr>
+      <td>${new Date(r.report_date).toLocaleDateString()}</td>
+      <td class="${r.status === "sent" ? "positive" : r.status === "failed" ? "negative" : ""}">${r.status}</td>
+      <td>${r.duration_ms != null ? `${(r.duration_ms / 1000).toFixed(1)}s` : "—"}</td>
+      <td>${fmtMoney(r.total_value)}</td>
+      <td>${r.error ? `<span class="negative">${r.error}</span>` : "—"}</td>
+    </tr>`
+    )
+    .join("");
 }
 
 function resetSummary() {
@@ -225,6 +280,40 @@ function renderValueChart(svg, points) {
   `;
 }
 
+// Editing (Section 11 "Could": edit, not just delete) reuses the add-holding
+// form rather than a separate inline editor — flip a mode flag, prefill the
+// fields, and branch the submit handler between insert and update.
+let editingHoldingId = null;
+
+function startEdit(h) {
+  if (!h) return;
+  editingHoldingId = h.id;
+  const form = document.getElementById("holdingForm");
+  form.ticker.value = h.ticker;
+  form.asset_type.value = h.asset_type;
+  form.quantity.value = h.quantity;
+  form.buy_price.value = h.buy_price;
+  form.buy_currency.value = h.buy_currency;
+  form.buy_date.value = h.buy_date;
+  document.getElementById("holdingFormTitle").textContent = `Edit ${h.ticker}`;
+  document.getElementById("formSubmitBtn").textContent = "Save changes";
+  document.getElementById("cancelEditBtn").style.display = "";
+  document.getElementById("tickerInput").focus();
+}
+
+function stopEdit() {
+  editingHoldingId = null;
+  document.getElementById("holdingFormTitle").textContent = "Add a holding";
+  document.getElementById("formSubmitBtn").textContent = "Add holding";
+  document.getElementById("cancelEditBtn").style.display = "none";
+}
+
+document.getElementById("cancelEditBtn").addEventListener("click", () => {
+  stopEdit();
+  document.getElementById("holdingForm").reset();
+  setDateToToday();
+});
+
 document.getElementById("holdingForm").addEventListener("submit", async (e) => {
   e.preventDefault();
   const errEl = document.getElementById("formError");
@@ -235,7 +324,6 @@ document.getElementById("holdingForm").addEventListener("submit", async (e) => {
   }
   const form = new FormData(e.target);
   const payload = {
-    user_id: currentUserId, // required by RLS: with check (auth.uid() = user_id)
     ticker: form.get("ticker").trim().toUpperCase(),
     asset_type: form.get("asset_type"),
     quantity: Number(form.get("quantity")),
@@ -247,6 +335,22 @@ document.getElementById("holdingForm").addEventListener("submit", async (e) => {
   if (!(payload.quantity > 0)) return (errEl.textContent = "Quantity must be positive.");
   if (!(payload.buy_price > 0)) return (errEl.textContent = "Buy price must be positive.");
 
+  if (editingHoldingId) {
+    const { error } = await sb.from("holdings").update(payload).eq("id", editingHoldingId);
+    if (error) {
+      errEl.textContent = `Could not save changes: ${error.message}`;
+      return;
+    }
+    stopEdit();
+    e.target.reset();
+    setDateToToday();
+    loadHoldings();
+    await triggerPriceRefresh(); // ticker may have changed
+    loadHoldings();
+    return;
+  }
+
+  payload.user_id = currentUserId; // required by RLS: with check (auth.uid() = user_id)
   const { error } = await sb.from("holdings").insert(payload);
   if (error) {
     errEl.textContent = `Could not save: ${error.message}`;
@@ -304,11 +408,13 @@ function showApp(user) {
   setDateToToday();
   loadHoldings();
   loadValueHistory();
+  loadRecentRuns();
   if (!window.__pollingStarted) {
     window.__pollingStarted = true;
     setInterval(() => {
       loadHoldings();
       loadValueHistory();
+      loadRecentRuns();
     }, 5 * 60 * 1000); // refresh the view every 5 min from cache (not the API)
   }
 }
