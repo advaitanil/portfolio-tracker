@@ -322,18 +322,31 @@ function renderValueChart(svg, rawPoints) {
     .map((f) => {
       const gy = padY + f * (height - 2 * padY);
       const val = max - f * range;
+      const label = fmtMoney(val);
+      // Rough monospace-ish width estimate so the backing pill fits the text —
+      // good enough for a currency string, doesn't need to be exact.
+      const labelWidth = label.length * 6.2 + 8;
+      const boxX = width - padX - labelWidth;
       return `<line x1="${padX}" y1="${gy.toFixed(1)}" x2="${width - padX}" y2="${gy.toFixed(1)}" stroke="#2a2e3a" stroke-width="1" stroke-dasharray="3,4"></line>
-        <text x="${(width - padX).toFixed(1)}" y="${(gy - 4).toFixed(1)}" fill="#6b7280" font-size="10" text-anchor="end">${fmtMoney(val)}</text>`;
+        <rect x="${boxX.toFixed(1)}" y="${(gy - 15).toFixed(1)}" width="${labelWidth.toFixed(1)}" height="15" fill="#171a21" fill-opacity="0.9" rx="3"></rect>
+        <text x="${(width - padX - 4).toFixed(1)}" y="${(gy - 4).toFixed(1)}" fill="#9aa0ac" font-size="10" text-anchor="end">${label}</text>`;
     })
     .join("");
+
+  const maxLabel = fmtMoney(max);
+  const minLabel = fmtMoney(min);
+  const maxLabelWidth = maxLabel.length * 6.5 + 8;
+  const minLabelWidth = minLabel.length * 6.5 + 8;
 
   svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
   svg.innerHTML = `
     ${gridLines}
     <path d="${areaPath}" fill="${stroke}" fill-opacity="0.12" stroke="none"></path>
     <path d="${linePath}" fill="none" stroke="${stroke}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"></path>
-    <text x="${padX}" y="16" fill="#9aa0ac" font-size="11">${fmtMoney(max)}</text>
-    <text x="${padX}" y="${height - 8}" fill="#9aa0ac" font-size="11">${fmtMoney(min)}</text>
+    <rect x="${(padX - 4).toFixed(1)}" y="4" width="${maxLabelWidth.toFixed(1)}" height="16" fill="#171a21" fill-opacity="0.9" rx="3"></rect>
+    <text x="${padX}" y="16" fill="#9aa0ac" font-size="11">${maxLabel}</text>
+    <rect x="${(padX - 4).toFixed(1)}" y="${height - 22}" width="${minLabelWidth.toFixed(1)}" height="16" fill="#171a21" fill-opacity="0.9" rx="3"></rect>
+    <text x="${padX}" y="${height - 8}" fill="#9aa0ac" font-size="11">${minLabel}</text>
   `;
 }
 
