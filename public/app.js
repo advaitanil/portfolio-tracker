@@ -105,12 +105,19 @@ async function loadHoldings() {
   const missing = priceCurrencies.filter((c) => !(c in fxRates));
   if (missing.length) Object.assign(fxRates, await fetchLatestFx(missing).catch(() => ({})));
 
-  // Computed over EVERY holding regardless of the portfolio filter — this
-  // whole-account total is what feeds the chart (Day 15 scope decision: the
-  // value-over-time chart stays whole-account, only the table/summary/
-  // allocation below get filtered by portfolio).
+  // Computed over EVERY holding regardless of the portfolio filter — the
+  // whole-account total feeds the "All portfolios" chart view below.
   const allRows = holdings.map((h) => ({ h, ...computeRow(h, prices[h.ticker], fxRates) }));
   const wholeAccountValue = allRows.reduce((s, r) => s + (r.currentValue || 0), 0);
+
+  // Per-portfolio totals — feeds each portfolio's own chart view. Holdings
+  // with no portfolio_id aren't part of any portfolio's series (only the
+  // whole-account one above).
+  const valueByPortfolio = {};
+  for (const r of allRows) {
+    if (!r.h.portfolio_id || !r.currentValue) continue;
+    valueByPortfolio[r.h.portfolio_id] = (valueByPortfolio[r.h.portfolio_id] || 0) + r.currentValue;
+  }
 
   // Portfolios (Day 15): "All portfolios" shows everything; a specific
   // selection filters down to just that portfolio's holdings for display.
@@ -145,26 +152,43 @@ async function loadHoldings() {
   // without a round trip — cheap since this is already the full list.
   window.__holdingsById = Object.fromEntries(holdings.map((h) => [h.id, h]));
 
-  // Keep today's chart point live: every time we recompute a real total (on
-  // load, after add/edit/sell/delete, or the 5-min poll), upsert it into
-  // portfolio_value_history so the chart never lags a full day behind — you
-  // don't have to wait for tomorrow's scheduled run just to see today's add
-  // reflected. Always the WHOLE-account value (not the filtered one) —
-  // portfolios don't get their own chart (see scope note above). RLS-scoped
-  // (auth.uid() = user_id), so this is safe from the browser with the anon
-  // key. Best-effort: a failure here shouldn't block the rest of the
-  // dashboard from rendering.
-  if (currentUserId && wholeAccountValue > 0) {
+  // Keep today's chart point(s) live: every time we recompute real totals (on
+  // load, after add/edit/sell/delete, or the 5-min poll), upsert them so the
+  // chart never lags a full day behind — you don't have to wait for
+  // tomorrow's scheduled run to see today's add reflected. Writes BOTH the
+  // whole-account point (portfolio_value_history) and one point per
+  // portfolio (portfolio_history) every time, regardless of which filter is
+  // currently selected — so switching the filter afterwards shows an
+  // up-to-date chart immediately instead of only the portfolio you happened
+  // to be looking at when you last edited something. RLS-scoped (auth.uid()
+  // = user_id), safe from the browser with the anon key. Best-effort: a
+  // failure here shouldn't block the rest of the dashboard from rendering.
+  if (currentUserId) {
     const todayStr = new Date().toISOString().slice(0, 10);
-    sb.from("portfolio_value_history")
-      .upsert(
-        { user_id: currentUserId, date: todayStr, total_value: wholeAccountValue, base_currency: BASE_CURRENCY, source: "live_update" },
-        { onConflict: "user_id,date" }
-      )
-      .then(({ error }) => {
-        if (error) console.warn("Could not update today's chart point:", error.message);
+    const upserts = [];
+    if (wholeAccountValue > 0) {
+      upserts.push(
+        sb.from("portfolio_value_history").upsert(
+          { user_id: currentUserId, date: todayStr, total_value: wholeAccountValue, base_currency: BASE_CURRENCY, source: "live_update" },
+          { onConflict: "user_id,date" }
+        )
+      );
+    }
+    for (const [portfolioId, value] of Object.entries(valueByPortfolio)) {
+      upserts.push(
+        sb.from("portfolio_history").upsert(
+          { user_id: currentUserId, portfolio_id: portfolioId, date: todayStr, total_value: value, base_currency: BASE_CURRENCY, source: "live_update" },
+          { onConflict: "portfolio_id,date" }
+        )
+      );
+    }
+    if (upserts.length) {
+      Promise.all(upserts).then((results) => {
+        const err = results.find((r) => r.error)?.error;
+        if (err) console.warn("Could not update today's chart point:", err.message);
         loadValueHistory();
       });
+    }
   }
 
   if (rows.length === 0) {
@@ -273,13 +297,24 @@ function resetSummary() {
 // Chart of real portfolio value over time — backfilled once from actual
 // historical closing prices since each holding's buy_date, then appended to
 // daily by the scheduled Worker. See worker/src/lib/history.js.
+// Follows the portfolio filter (Day 16): "All portfolios" reads the
+// whole-account series (portfolio_value_history); a specific portfolio reads
+// its own series (portfolio_history, scoped by portfolio_id). Both tables are
+// kept live by loadHoldings() above and by the Worker's daily job/backfill.
 async function loadValueHistory() {
   const svg = document.getElementById("valueChart");
   const caption = document.getElementById("chartCaption");
-  const { data, error } = await sb
-    .from("portfolio_value_history")
-    .select("date, total_value")
-    .order("date", { ascending: true });
+  const heading = document.getElementById("chartHeading");
+
+  const viewingAll = selectedPortfolioId === "__all__";
+  const portfolioName = viewingAll ? null : allPortfolios.find((p) => p.id === selectedPortfolioId)?.name;
+  heading.textContent = viewingAll ? "Portfolio Value Over Time" : `Portfolio Value Over Time — ${portfolioName || "…"}`;
+
+  const query = viewingAll
+    ? sb.from("portfolio_value_history").select("date, total_value").order("date", { ascending: true })
+    : sb.from("portfolio_history").select("date, total_value").eq("portfolio_id", selectedPortfolioId).order("date", { ascending: true });
+
+  const { data, error } = await query;
 
   if (error) {
     svg.innerHTML = "";
@@ -288,7 +323,9 @@ async function loadValueHistory() {
   }
   if (!data || data.length === 0) {
     svg.innerHTML = "";
-    caption.textContent = "No history yet — visit <WORKER_URL>/backfill-history once to seed it from real historical prices, or check back after a few scheduled runs.";
+    caption.textContent = viewingAll
+      ? "No history yet — visit <WORKER_URL>/backfill-history once to seed it from real historical prices, or check back after a few scheduled runs."
+      : "No history yet for this portfolio — it'll appear after your next edit/poll (live) or the next /backfill-history run (real historical prices).";
     return;
   }
 
@@ -573,9 +610,9 @@ async function loadRealizedGains() {
 
 // --- Portfolios: an optional grouping layer on top of holdings ------------
 // Scope decision (see README/schema.sql): portfolios filter the holdings
-// table, summary stats, and allocation only. The value chart, daily email,
-// and realized gains all stay whole-account — splitting those per portfolio
-// too would mean multiple emails/charts per user, out of scope here.
+// table, summary stats, allocation, and the value chart (loadValueHistory,
+// below). The daily email and realized gains stay whole-account — splitting
+// those too would mean multiple emails per user each morning, out of scope.
 let allPortfolios = [];
 let selectedPortfolioId = "__all__";
 
@@ -628,6 +665,7 @@ document.getElementById("portfolioFilterSelect").addEventListener("change", (e) 
   updatePortfolioBarButtons();
   setPortfolioFormDefault();
   loadHoldings();
+  loadValueHistory(); // don't wait on loadHoldings' async upsert chain — redraw for the new filter right away
 });
 
 document.getElementById("newPortfolioBtn").addEventListener("click", async () => {
@@ -644,6 +682,7 @@ document.getElementById("newPortfolioBtn").addEventListener("click", async () =>
   updatePortfolioBarButtons();
   setPortfolioFormDefault();
   loadHoldings();
+  loadValueHistory();
 });
 
 document.getElementById("renamePortfolioBtn").addEventListener("click", async () => {
@@ -656,13 +695,14 @@ document.getElementById("renamePortfolioBtn").addEventListener("click", async ()
     alert(`Could not rename portfolio: ${error.message}`);
     return;
   }
-  loadPortfolios();
+  await loadPortfolios();
+  loadValueHistory(); // picks up the new name in the chart heading
 });
 
 document.getElementById("deletePortfolioBtn").addEventListener("click", async () => {
   if (selectedPortfolioId === "__all__") return;
   const current = allPortfolios.find((p) => p.id === selectedPortfolioId);
-  if (!confirm(`Delete portfolio "${current?.name}"? Its holdings are NOT deleted — they just become unassigned and stay visible under "All portfolios".`)) return;
+  if (!confirm(`Delete portfolio "${current?.name}"? Its holdings are NOT deleted — they just become unassigned and stay visible under "All portfolios". Its chart history IS deleted.`)) return;
   const { error } = await sb.from("portfolios").delete().eq("id", selectedPortfolioId);
   if (error) {
     alert(`Could not delete portfolio: ${error.message}`);
@@ -671,6 +711,7 @@ document.getElementById("deletePortfolioBtn").addEventListener("click", async ()
   selectedPortfolioId = "__all__";
   await loadPortfolios();
   loadHoldings();
+  loadValueHistory();
 });
 
 // --- Ticker search/autocomplete --------------------------------------------
@@ -810,10 +851,43 @@ document.getElementById("runNowBtn").addEventListener("click", async () => {
   }
 });
 
+// Weighted-average cost basis (Day 16): adding to (or editing into) a ticker
+// you already hold IN THE SAME PORTFOLIO merges into that one row instead of
+// leaving two rows for the same position — quantity sums, buy_price becomes
+// the quantity-weighted average of the two, buy_date keeps the EARLIER of
+// the two (preserves how long you've actually held the position). Matching
+// is scoped to (ticker, portfolio_id) — the same ticker in a DIFFERENT
+// portfolio is a deliberately separate position, not merged. Only merges
+// when buy_currency also matches: averaging cost basis across currencies
+// would need the historical FX rate at each individual purchase, which this
+// app doesn't track (same simplification already used for cost-basis FX
+// elsewhere) — a currency mismatch is added/kept as its own row instead,
+// with a status message explaining why.
+async function findSameTickerHoldings(ticker, portfolioId, excludeId) {
+  let q = sb.from("holdings").select("*").eq("ticker", ticker);
+  q = portfolioId ? q.eq("portfolio_id", portfolioId) : q.is("portfolio_id", null);
+  if (excludeId) q = q.neq("id", excludeId);
+  const { data, error } = await q;
+  if (error) {
+    console.warn("Could not check for an existing holding to merge with:", error.message);
+    return [];
+  }
+  return data || [];
+}
+
+function weightedMerge(existing, incoming) {
+  const newQuantity = Number(existing.quantity) + Number(incoming.quantity);
+  const buyPrice = (Number(existing.quantity) * Number(existing.buy_price) + Number(incoming.quantity) * Number(incoming.buy_price)) / newQuantity;
+  const buyDate = incoming.buy_date < existing.buy_date ? incoming.buy_date : existing.buy_date;
+  return { quantity: newQuantity, buy_price: buyPrice, buy_date: buyDate };
+}
+
 document.getElementById("holdingForm").addEventListener("submit", async (e) => {
   e.preventDefault();
   const errEl = document.getElementById("formError");
+  const statusEl = document.getElementById("formStatus");
   errEl.textContent = "";
+  statusEl.textContent = "";
   if (!currentUserId) {
     errEl.textContent = "Not signed in — please sign in again.";
     return;
@@ -833,10 +907,34 @@ document.getElementById("holdingForm").addEventListener("submit", async (e) => {
   if (!(payload.buy_price > 0)) return (errEl.textContent = "Buy price must be positive.");
 
   if (editingHoldingId) {
-    const { error } = await sb.from("holdings").update(payload).eq("id", editingHoldingId);
-    if (error) {
-      errEl.textContent = `Could not save changes: ${error.message}`;
-      return;
+    const sameTicker = await findSameTickerHoldings(payload.ticker, payload.portfolio_id, editingHoldingId);
+    const collision = sameTicker.find((h) => h.buy_currency === payload.buy_currency);
+
+    if (collision) {
+      // The edit now matches another existing row exactly (ticker +
+      // portfolio + currency) — merge into that row and remove this one,
+      // rather than leaving two rows for the same position.
+      const merged = weightedMerge(collision, payload);
+      const { error: mergeError } = await sb.from("holdings").update(merged).eq("id", collision.id);
+      if (mergeError) {
+        errEl.textContent = `Could not merge: ${mergeError.message}`;
+        return;
+      }
+      const { error: delError } = await sb.from("holdings").delete().eq("id", editingHoldingId);
+      if (delError) {
+        errEl.textContent = `Merged, but could not remove the old duplicate row: ${delError.message}`;
+      } else {
+        statusEl.textContent = `Merged into your existing ${payload.ticker} position — now ${merged.quantity} @ weighted avg ${fmtMoneyIn(merged.buy_price, payload.buy_currency)}.`;
+      }
+    } else {
+      const { error } = await sb.from("holdings").update(payload).eq("id", editingHoldingId);
+      if (error) {
+        errEl.textContent = `Could not save changes: ${error.message}`;
+        return;
+      }
+      if (sameTicker.length) {
+        statusEl.textContent = `Saved as its own row — an existing ${payload.ticker} holding in this portfolio is in ${sameTicker[0].buy_currency}, so it wasn't merged.`;
+      }
     }
     stopEdit();
     e.target.reset();
@@ -849,15 +947,33 @@ document.getElementById("holdingForm").addEventListener("submit", async (e) => {
   }
 
   payload.user_id = currentUserId; // required by RLS: with check (auth.uid() = user_id)
-  const { error } = await sb.from("holdings").insert(payload);
-  if (error) {
-    errEl.textContent = `Could not save: ${error.message}`;
-    return;
+
+  const sameTicker = await findSameTickerHoldings(payload.ticker, payload.portfolio_id, null);
+  const existing = sameTicker.find((h) => h.buy_currency === payload.buy_currency);
+
+  if (existing) {
+    const merged = weightedMerge(existing, payload);
+    const { error } = await sb.from("holdings").update(merged).eq("id", existing.id);
+    if (error) {
+      errEl.textContent = `Could not merge into existing holding: ${error.message}`;
+      return;
+    }
+    statusEl.textContent = `Merged into your existing ${payload.ticker} position — now ${merged.quantity} @ weighted avg ${fmtMoneyIn(merged.buy_price, payload.buy_currency)}.`;
+  } else {
+    const { error } = await sb.from("holdings").insert(payload);
+    if (error) {
+      errEl.textContent = `Could not save: ${error.message}`;
+      return;
+    }
+    if (sameTicker.length) {
+      statusEl.textContent = `Added as its own row — an existing ${payload.ticker} holding in this portfolio is in ${sameTicker[0].buy_currency}, so it wasn't merged.`;
+    }
   }
+
   e.target.reset();
   setDateToToday(); // form.reset() clears the date field back to blank — refill it
   setPortfolioFormDefault(); // form.reset() also clears this back to "No portfolio" — refill from the active filter
-  loadHoldings(); // show the new row immediately (price will say "no data" until the refresh below lands)
+  loadHoldings(); // show the new/merged row immediately (price will say "no data" until the refresh below lands)
   await triggerPriceRefresh();
   loadHoldings(); // reload once the Worker has cached a price for the new ticker
 });

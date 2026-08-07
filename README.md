@@ -116,13 +116,14 @@ table + `holdings.portfolio_id`) — see the migration block at the bottom of
 
 **Portfolios, scoped:** you can now group holdings into named portfolios
 (e.g. "Retirement", "Trading") and filter the dashboard by one, or view
-everything under "All portfolios". This filters the holdings table, the
-summary stats, and the allocation breakdown only — the **value-over-time
-chart, the daily email, and realized gains all stay whole-account**
-(every portfolio combined), by design, not an oversight. Splitting those
-per portfolio too (separate charts, separate emails) would be a much bigger
-rearchitecture than was asked for; this keeps portfolios a lightweight
-organizing/filtering layer instead.
+everything under "All portfolios". This filters the holdings table, summary
+stats, allocation breakdown, **and the value-over-time chart** (each
+portfolio has its own real history, in a separate `portfolio_history` table —
+see schema.sql). The **daily email and realized gains stay whole-account**
+(every portfolio combined) — splitting those per portfolio too (multiple
+emails per morning) wasn't asked for and would be a bigger rearchitecture;
+this keeps the email as one summary of everything while still letting the
+dashboard itself be filtered.
 
 ### 1. Accounts (Section 3 of the brief)
 

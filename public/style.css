@@ -66,6 +66,7 @@ button {
 }
 button:hover { opacity: 0.9; }
 .form-error { color: var(--red); font-size: 0.85rem; min-height: 1.2em; }
+.form-status { color: var(--green); font-size: 0.85rem; min-height: 1.2em; margin: 0; }
 
 table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }

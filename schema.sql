@@ -28,11 +28,11 @@ create index if not exists idx_holdings_portfolio on holdings (portfolio_id);
 -- Optional grouping layer on top of holdings — e.g. "Retirement", "Trading".
 -- Deliberately lightweight: a portfolio is just a name a user's holdings can
 -- point at. Scope decision (see README): portfolios filter the dashboard's
--- holdings table/summary/allocation only. The value-over-time chart, the
--- daily email, and realized gains all stay whole-account (every portfolio
--- combined), same as before this feature — splitting those per portfolio too
--- would mean multiple emails/charts per user, a much bigger rearchitecture
--- that wasn't asked for.
+-- holdings table/summary/allocation AND the value-over-time chart (see
+-- portfolio_history below, which gives each portfolio its own real history).
+-- The daily email and realized gains stay whole-account (every portfolio
+-- combined) — splitting those too would mean multiple emails per user each
+-- morning, a bigger rearchitecture that wasn't asked for.
 create table if not exists portfolios (
   id         uuid primary key default gen_random_uuid(),
   user_id    uuid not null references auth.users (id) on delete cascade,
@@ -111,6 +111,33 @@ create table if not exists portfolio_value_history (
 );
 create unique index if not exists idx_portfolio_value_history_user_date on portfolio_value_history (user_id, date);
 
+-- ── portfolio_history ───────────────────────────────────────────────────────
+-- Same idea as portfolio_value_history, but PER PORTFOLIO instead of whole-
+-- account. Kept as its own table (not a nullable portfolio_id column on
+-- portfolio_value_history) specifically to sidestep a Postgres gotcha: a
+-- unique index on (user_id, date) with a nullable portfolio_id would treat
+-- every NULL as distinct from every other NULL, so upserting the
+-- whole-account row would never actually collide/update — it'd just keep
+-- inserting new rows. Two clean tables avoids that entirely.
+-- portfolio_id is NOT NULL here on purpose: a holding with no portfolio
+-- assigned isn't part of any portfolio's chart, only the whole-account one.
+-- Backfilled with real historical prices per portfolio (same holdings-since-
+-- buy_date approach as portfolio_value_history, just scoped to a subset of
+-- holdings), then appended to daily by the scheduled job, and kept live by
+-- the front end after every add/edit/sell/delete (see app.js loadHoldings).
+create table if not exists portfolio_history (
+  id            uuid primary key default gen_random_uuid(),
+  user_id       uuid not null references auth.users (id) on delete cascade,
+  portfolio_id  uuid not null references portfolios (id) on delete cascade,
+  date          date not null,
+  total_value   numeric not null,
+  base_currency text not null,
+  source        text not null default 'backfill', -- 'backfill' | 'daily_job' | 'live_update'
+  created_at    timestamptz not null default now()
+);
+create unique index if not exists idx_portfolio_history_portfolio_date on portfolio_history (portfolio_id, date);
+create index if not exists idx_portfolio_history_user on portfolio_history (user_id);
+
 -- ── realized_gains ───────────────────────────────────────────────────────────
 -- One row per "sell" event — a closed position, distinct from just deleting a
 -- holding. Deleting a holding discards it with no record (for fixing a data
@@ -158,6 +185,7 @@ alter table prices enable row level security;
 alter table fx_rates enable row level security;
 alter table daily_reports enable row level security;
 alter table portfolio_value_history enable row level security;
+alter table portfolio_history enable row level security;
 alter table realized_gains enable row level security;
 
 create policy "users manage own portfolios" on portfolios for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
@@ -166,6 +194,7 @@ create policy "authenticated read/write prices" on prices for all using (auth.ro
 create policy "authenticated read/write fx_rates" on fx_rates for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
 create policy "users manage own daily_reports" on daily_reports for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
 create policy "users manage own portfolio_value_history" on portfolio_value_history for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+create policy "users manage own portfolio_history" on portfolio_history for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
 create policy "users manage own realized_gains" on realized_gains for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
 
 -- No seed data here on purpose: holdings now require a real user_id, and
@@ -196,3 +225,28 @@ create policy "users manage own realized_gains" on realized_gains for all using 
 -- Existing holdings will have portfolio_id = null, which the dashboard shows
 -- as "unassigned" and always includes under "All portfolios" — nothing is
 -- hidden by this migration.
+
+-- ── Migration: adding the per-portfolio value chart (portfolio_history) ────
+-- Run this once too if you already ran the portfolios migration above before
+-- this feature existed:
+--
+--   create table if not exists portfolio_history (
+--     id            uuid primary key default gen_random_uuid(),
+--     user_id       uuid not null references auth.users (id) on delete cascade,
+--     portfolio_id  uuid not null references portfolios (id) on delete cascade,
+--     date          date not null,
+--     total_value   numeric not null,
+--     base_currency text not null,
+--     source        text not null default 'backfill',
+--     created_at    timestamptz not null default now()
+--   );
+--   create unique index if not exists idx_portfolio_history_portfolio_date
+--     on portfolio_history (portfolio_id, date);
+--   create index if not exists idx_portfolio_history_user on portfolio_history (user_id);
+--   alter table portfolio_history enable row level security;
+--   create policy "users manage own portfolio_history" on portfolio_history for all
+--     using (auth.uid() = user_id) with check (auth.uid() = user_id);
+--
+-- After running this, visit <your-worker>/backfill-history once more to
+-- seed real historical per-portfolio data — until then, a portfolio's chart
+-- will only show "today" (from live updates) going forward.

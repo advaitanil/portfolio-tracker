@@ -190,7 +190,43 @@ async function backfillHistory(env) {
         points.map((p) => ({ date: p.date, total_value: p.total_value, base_currency: baseCurrency, source: "backfill", user_id: user.id })),
         "user_id,date"
       );
-      perUser.push({ email: user.email, ok: true, pointsWritten: points.length, from: points[0].date, to: points[points.length - 1].date });
+
+      // Same backfill, scoped to each of this user's named portfolios — reuses
+      // the SAME priceHistory/fxHistory maps fetched above, so this costs zero
+      // extra market-data API calls, just extra arithmetic. Portfolio
+      // membership is applied as of TODAY, not historically (a holding didn't
+      // necessarily belong to its current portfolio on every day since its
+      // buy_date) — same kind of "use current data, not a true point-in-time
+      // reconstruction" simplification already used for buy-currency FX.
+      const portfolioIds = [...new Set(holdings.map((h) => h.portfolio_id).filter(Boolean))];
+      let portfoliosWritten = 0;
+      for (const portfolioId of portfolioIds) {
+        const portfolioHoldings = holdings.filter((h) => h.portfolio_id === portfolioId);
+        const pPoints = computeHistoryValues({ holdings: portfolioHoldings, priceHistory, fxHistory, baseCurrency });
+        if (!pPoints.length) continue;
+        await sb.upsertRows(
+          "portfolio_history",
+          pPoints.map((p) => ({
+            date: p.date,
+            total_value: p.total_value,
+            base_currency: baseCurrency,
+            source: "backfill",
+            user_id: user.id,
+            portfolio_id: portfolioId,
+          })),
+          "portfolio_id,date"
+        );
+        portfoliosWritten++;
+      }
+
+      perUser.push({
+        email: user.email,
+        ok: true,
+        pointsWritten: points.length,
+        from: points[0].date,
+        to: points[points.length - 1].date,
+        portfoliosBackfilled: portfoliosWritten,
+      });
     }
 
     return { ok: true, users: perUser };
@@ -324,13 +360,40 @@ async function processUserDailyJob({ user, holdings, priceResults, fxRatesToday,
     if (metrics.flagged.length > 0) status = "partial"; // graceful degradation, not silence
 
     // Append today's real value to this user's chart history (Day 14).
+    const todayStr = new Date().toISOString().slice(0, 10);
     await sb
       .upsertRows(
         "portfolio_value_history",
-        [{ date: new Date().toISOString().slice(0, 10), total_value: metrics.totalValue, base_currency: baseCurrency, source: "daily_job", user_id: user.id }],
+        [{ date: todayStr, total_value: metrics.totalValue, base_currency: baseCurrency, source: "daily_job", user_id: user.id }],
         "user_id,date"
       )
       .catch((e) => console.error(`[${user.email}] Failed to append value history (continuing anyway):`, e.message));
+
+    // Same, per portfolio — metrics.holdings is index-aligned with `holdings`
+    // (computePortfolioMetrics does holdings.map(...)), so zip by index
+    // rather than matching on ticker: a ticker can now legitimately appear in
+    // more than one of a user's portfolios, and a ticker-based lookup would
+    // silently attribute both to whichever one it found first.
+    const valueByPortfolio = {};
+    holdings.forEach((h, i) => {
+      if (!h.portfolio_id) return;
+      const r = metrics.holdings[i];
+      if (!r || r.currentValue == null) return;
+      valueByPortfolio[h.portfolio_id] = (valueByPortfolio[h.portfolio_id] || 0) + r.currentValue;
+    });
+    const portfolioHistoryRows = Object.entries(valueByPortfolio).map(([portfolio_id, total_value]) => ({
+      date: todayStr,
+      total_value,
+      base_currency: baseCurrency,
+      source: "daily_job",
+      user_id: user.id,
+      portfolio_id,
+    }));
+    if (portfolioHistoryRows.length) {
+      await sb
+        .upsertRows("portfolio_history", portfolioHistoryRows, "portfolio_id,date")
+        .catch((e) => console.error(`[${user.email}] Failed to append per-portfolio value history (continuing anyway):`, e.message));
+    }
 
     // News (Day 8/9) — never let a news failure block the email.
     const news = await fetchNews(holdings, env).catch((e) => {

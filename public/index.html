@@ -40,7 +40,7 @@
       <button type="button" id="renamePortfolioBtn" style="display: none">Rename</button>
       <button type="button" id="deletePortfolioBtn" class="del-btn" style="display: none">Delete</button>
     </section>
-    <p class="portfolio-bar-note" id="portfolioBarNote">Filtering the holdings table, summary, and allocation below. The value chart, daily email, and realized gains stay whole-account.</p>
+    <p class="portfolio-bar-note" id="portfolioBarNote">Filtering the holdings table, summary, allocation, and value chart below. The daily email and realized gains stay whole-account.</p>
 
     <section class="summary" id="summary">
       <div class="stat">
@@ -62,7 +62,7 @@
     </section>
 
     <section class="chart-section" id="chartSection">
-      <h2>Portfolio Value Over Time</h2>
+      <h2 id="chartHeading">Portfolio Value Over Time</h2>
       <svg id="valueChart" viewBox="0 0 700 260" preserveAspectRatio="none"></svg>
       <p class="chart-caption" id="chartCaption">No history yet — run a backfill or check back after a few scheduled runs.</p>
     </section>
@@ -109,6 +109,7 @@
         <button type="button" id="cancelEditBtn" style="display: none">Cancel edit</button>
       </form>
       <p class="form-error" id="formError"></p>
+      <p class="form-status" id="formStatus"></p>
     </section>
 
     <section class="holdings">
