@@ -99,7 +99,8 @@ header h1 { flex: 1; }
 
 .chart-section svg {
   width: 100%;
-  height: 220px;
+  height: 260px;
+  max-width: 900px;
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 10px;

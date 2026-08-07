@@ -258,30 +258,82 @@ async function loadValueHistory() {
   caption.textContent = `${new Date(first.date).toLocaleDateString()} – ${new Date(last.date).toLocaleDateString()} · ${data.length} day${data.length === 1 ? "" : "s"} of history`;
 }
 
-function renderValueChart(svg, points) {
+// Cap how many points get plotted — a long backfill can produce hundreds of
+// daily rows, and plotting every single one makes the line look noisy/jagged
+// without adding real information at typical chart widths. Downsampling
+// picks evenly-spaced actual data points (never invented ones) and always
+// keeps the first and last.
+function downsample(points, maxPoints) {
+  if (points.length <= maxPoints) return points;
+  const step = (points.length - 1) / (maxPoints - 1);
+  const result = [];
+  for (let i = 0; i < maxPoints; i++) result.push(points[Math.round(i * step)]);
+  return result;
+}
+
+// Catmull-Rom-to-Bezier spline through the exact plotted points — this only
+// changes how the line is DRAWN between real data points (a smooth curve
+// instead of sharp straight-line joints), it never alters or invents a
+// value. Every vertex on the curve is still a real, exact data point.
+function smoothPath(pts) {
+  if (pts.length < 3) return `M ${pts.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" L ")}`;
+  let d = `M ${pts[0].x.toFixed(1)},${pts[0].y.toFixed(1)}`;
+  for (let i = 0; i < pts.length - 1; i++) {
+    const p0 = pts[i - 1] || pts[i];
+    const p1 = pts[i];
+    const p2 = pts[i + 1];
+    const p3 = pts[i + 2] || p2;
+    const c1x = p1.x + (p2.x - p0.x) / 6;
+    const c1y = p1.y + (p2.y - p0.y) / 6;
+    const c2x = p2.x - (p3.x - p1.x) / 6;
+    const c2y = p2.y - (p3.y - p1.y) / 6;
+    d += ` C ${c1x.toFixed(1)},${c1y.toFixed(1)} ${c2x.toFixed(1)},${c2y.toFixed(1)} ${p2.x.toFixed(1)},${p2.y.toFixed(1)}`;
+  }
+  return d;
+}
+
+function renderValueChart(svg, rawPoints) {
+  const points = downsample(rawPoints, 90);
   const width = 700;
-  const height = 220;
-  const padX = 10;
-  const padY = 20;
+  const height = 260; // taller than before — a wide-but-short chart is what made it look "stretched"
+  const padX = 12;
+  const padY = 30;
 
   const values = points.map((p) => p.total_value);
   const min = Math.min(...values);
   const max = Math.max(...values);
   const range = max - min || 1; // flat line (or single point): avoid divide-by-zero
 
-  const x = (i) => (points.length === 1 ? width / 2 : padX + (i * (width - 2 * padX)) / (points.length - 1));
-  const y = (v) => padY + (1 - (v - min) / range) * (height - 2 * padY);
+  const xAt = (i) => (points.length === 1 ? width / 2 : padX + (i * (width - 2 * padX)) / (points.length - 1));
+  const yAt = (v) => padY + (1 - (v - min) / range) * (height - 2 * padY);
+  const coords = points.map((p, i) => ({ x: xAt(i), y: yAt(p.total_value) }));
 
-  const linePoints = points.map((p, i) => `${x(i).toFixed(1)},${y(p.total_value).toFixed(1)}`).join(" ");
-  const areaPoints = `${x(0).toFixed(1)},${(height - padY).toFixed(1)} ${linePoints} ${x(points.length - 1).toFixed(1)},${(height - padY).toFixed(1)}`;
+  const linePath = smoothPath(coords);
+  const floorY = (height - padY).toFixed(1);
+  const areaPath = `${linePath} L ${coords[coords.length - 1].x.toFixed(1)},${floorY} L ${coords[0].x.toFixed(1)},${floorY} Z`;
+
   const trendUp = values[values.length - 1] >= values[0];
   const stroke = trendUp ? "#3ddc97" : "#ff6b6b";
 
+  // Dashed reference lines at 25/50/75% of the visible range, each labelled —
+  // gives the eye something to measure against instead of just two numbers
+  // floating at the top/bottom corners.
+  const gridLines = [0.25, 0.5, 0.75]
+    .map((f) => {
+      const gy = padY + f * (height - 2 * padY);
+      const val = max - f * range;
+      return `<line x1="${padX}" y1="${gy.toFixed(1)}" x2="${width - padX}" y2="${gy.toFixed(1)}" stroke="#2a2e3a" stroke-width="1" stroke-dasharray="3,4"></line>
+        <text x="${(width - padX).toFixed(1)}" y="${(gy - 4).toFixed(1)}" fill="#6b7280" font-size="10" text-anchor="end">${fmtMoney(val)}</text>`;
+    })
+    .join("");
+
+  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
   svg.innerHTML = `
-    <polygon points="${areaPoints}" fill="${stroke}" fill-opacity="0.12" stroke="none"></polygon>
-    <polyline points="${linePoints}" fill="none" stroke="${stroke}" stroke-width="2"></polyline>
-    <text x="${padX}" y="14" fill="#9aa0ac" font-size="11">${fmtMoney(max)}</text>
-    <text x="${padX}" y="${height - 6}" fill="#9aa0ac" font-size="11">${fmtMoney(min)}</text>
+    ${gridLines}
+    <path d="${areaPath}" fill="${stroke}" fill-opacity="0.12" stroke="none"></path>
+    <path d="${linePath}" fill="none" stroke="${stroke}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"></path>
+    <text x="${padX}" y="16" fill="#9aa0ac" font-size="11">${fmtMoney(max)}</text>
+    <text x="${padX}" y="${height - 8}" fill="#9aa0ac" font-size="11">${fmtMoney(min)}</text>
   `;
 }
 
@@ -429,14 +481,26 @@ async function loadRealizedGains() {
     .select("*")
     .order("sell_date", { ascending: false });
 
+  const totalEl = document.getElementById("totalRealizedGain");
+
   if (error) {
     tbody.innerHTML = `<tr><td colspan="6">Could not load realized gains: ${error.message}</td></tr>`;
+    totalEl.textContent = "—";
     return;
   }
   if (!data || data.length === 0) {
     tbody.innerHTML = `<tr><td colspan="6">No closed positions yet — use "Sell" on a holding to record one.</td></tr>`;
+    totalEl.textContent = fmtMoney(0);
+    totalEl.className = "value";
     return;
   }
+
+  // Running total across every closed position — "how much am I up from
+  // sales", distinct from the unrealised gain/loss stat (which only covers
+  // what's still held).
+  const totalRealized = data.reduce((s, r) => s + (r.realized_gain_abs || 0), 0);
+  totalEl.textContent = fmtMoney(totalRealized);
+  totalEl.className = "value " + pctClass(totalRealized);
 
   tbody.innerHTML = data
     .map(
