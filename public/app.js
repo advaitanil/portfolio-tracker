@@ -148,6 +148,7 @@ async function loadHoldings() {
       <td class="${pctClass(gainPct)}">${fmtPct(gainPct)}</td>
       <td>${totalValue ? fmtPct((currentValue / totalValue) * 100).replace("+", "") : "—"}</td>
       <td>
+        <button class="sell-btn" data-id="${h.id}">Sell</button>
         <button class="edit-btn" data-id="${h.id}">Edit</button>
         <button class="del-btn" data-id="${h.id}">Delete</button>
       </td>
@@ -156,7 +157,7 @@ async function loadHoldings() {
 
   tbody.querySelectorAll(".del-btn").forEach((btn) =>
     btn.addEventListener("click", async () => {
-      if (!confirm("Delete this holding?")) return;
+      if (!confirm("Delete this holding? This does NOT record a sale — use \"Sell\" instead if you actually disposed of it.")) return;
       await sb.from("holdings").delete().eq("id", btn.dataset.id);
       loadHoldings();
     })
@@ -164,6 +165,10 @@ async function loadHoldings() {
 
   tbody.querySelectorAll(".edit-btn").forEach((btn) =>
     btn.addEventListener("click", () => startEdit(window.__holdingsById[btn.dataset.id]))
+  );
+
+  tbody.querySelectorAll(".sell-btn").forEach((btn) =>
+    btn.addEventListener("click", () => startSell(window.__holdingsById[btn.dataset.id]))
   );
 }
 
@@ -314,6 +319,140 @@ document.getElementById("cancelEditBtn").addEventListener("click", () => {
   setDateToToday();
 });
 
+// --- Realized gains: selling records a closed position instead of just
+// discarding the holding (distinct from Delete, which is for fixing a
+// mistaken entry, not recording a real disposal). Supports partial sells —
+// selling less than the full quantity reduces the holding rather than
+// removing it.
+let sellingHolding = null;
+
+function startSell(h) {
+  if (!h) return;
+  sellingHolding = h;
+  document.getElementById("sellTicker").textContent = h.ticker;
+  document.getElementById("sellQuantityInput").max = h.quantity;
+  document.getElementById("sellQuantityInput").value = h.quantity;
+  document.getElementById("sellCurrencySelect").value = h.buy_currency;
+  document.getElementById("sellDateInput").value = new Date().toISOString().slice(0, 10);
+  document.getElementById("sellError").textContent = "";
+  document.getElementById("sellSection").style.display = "";
+  document.getElementById("sellSection").scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+function stopSell() {
+  sellingHolding = null;
+  document.getElementById("sellSection").style.display = "none";
+  document.getElementById("sellForm").reset();
+}
+
+document.getElementById("cancelSellBtn").addEventListener("click", stopSell);
+
+document.getElementById("sellForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const errEl = document.getElementById("sellError");
+  errEl.textContent = "";
+  if (!sellingHolding || !currentUserId) {
+    errEl.textContent = "Nothing selected to sell.";
+    return;
+  }
+
+  const form = new FormData(e.target);
+  const sellQuantity = Number(form.get("sell_quantity"));
+  const sellPrice = Number(form.get("sell_price"));
+  const sellCurrency = form.get("sell_currency");
+  const sellDate = form.get("sell_date");
+
+  if (!(sellQuantity > 0)) return (errEl.textContent = "Quantity must be positive.");
+  if (sellQuantity > sellingHolding.quantity) return (errEl.textContent = `Can't sell more than the ${sellingHolding.quantity} you hold.`);
+  if (!(sellPrice > 0)) return (errEl.textContent = "Sell price must be positive.");
+
+  // Known limitation (documented in schema.sql/README): the buy side is
+  // converted at whatever FX rate is cached right now, not the rate on
+  // buy_date — same simplification the live unrealised-gain figures use.
+  const fxRates = await fetchLatestFx([sellingHolding.buy_currency, sellCurrency]).catch(() => ({ [BASE_CURRENCY]: 1 }));
+  const buyFx = fxRates[sellingHolding.buy_currency] ?? null;
+  const sellFx = fxRates[sellCurrency] ?? null;
+
+  // fxRates[currency] is "1 unit of that currency, expressed in base
+  // currency" (see fetchLatestFx above) — so converting TO base means
+  // multiplying, same as computeRow()'s priceInBase = price * fx.
+  let realizedGainAbs = null;
+  let realizedGainPct = null;
+  if (buyFx && sellFx) {
+    const buyValueBase = sellQuantity * sellingHolding.buy_price * buyFx;
+    const sellValueBase = sellQuantity * sellPrice * sellFx;
+    realizedGainAbs = sellValueBase - buyValueBase;
+    realizedGainPct = buyValueBase ? (realizedGainAbs / buyValueBase) * 100 : null;
+  }
+
+  const { error: insertError } = await sb.from("realized_gains").insert({
+    user_id: currentUserId,
+    ticker: sellingHolding.ticker,
+    asset_type: sellingHolding.asset_type,
+    quantity: sellQuantity,
+    buy_price: sellingHolding.buy_price,
+    buy_currency: sellingHolding.buy_currency,
+    buy_date: sellingHolding.buy_date,
+    sell_price: sellPrice,
+    sell_currency: sellCurrency,
+    sell_date: sellDate,
+    base_currency: BASE_CURRENCY,
+    realized_gain_abs: realizedGainAbs,
+    realized_gain_pct: realizedGainPct,
+  });
+  if (insertError) {
+    errEl.textContent = `Could not record sale: ${insertError.message}`;
+    return;
+  }
+
+  // Full sell removes the holding; partial sell just reduces its quantity.
+  if (sellQuantity >= sellingHolding.quantity) {
+    await sb.from("holdings").delete().eq("id", sellingHolding.id);
+  } else {
+    await sb
+      .from("holdings")
+      .update({ quantity: sellingHolding.quantity - sellQuantity })
+      .eq("id", sellingHolding.id);
+  }
+
+  stopSell();
+  loadHoldings();
+  loadRealizedGains();
+});
+
+// Day 11-style "Could" addition: a record of every closed position, not just
+// what you currently hold.
+async function loadRealizedGains() {
+  const tbody = document.getElementById("realizedGainsBody");
+  const { data, error } = await sb
+    .from("realized_gains")
+    .select("*")
+    .order("sell_date", { ascending: false });
+
+  if (error) {
+    tbody.innerHTML = `<tr><td colspan="6">Could not load realized gains: ${error.message}</td></tr>`;
+    return;
+  }
+  if (!data || data.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="6">No closed positions yet — use "Sell" on a holding to record one.</td></tr>`;
+    return;
+  }
+
+  tbody.innerHTML = data
+    .map(
+      (r) => `
+    <tr>
+      <td>${r.ticker}</td>
+      <td>${r.quantity}</td>
+      <td>${fmtMoneyIn(r.buy_price, r.buy_currency)}</td>
+      <td>${fmtMoneyIn(r.sell_price, r.sell_currency)}</td>
+      <td>${new Date(r.sell_date).toLocaleDateString()}</td>
+      <td class="${pctClass(r.realized_gain_abs)}">${r.realized_gain_abs != null ? fmtMoney(r.realized_gain_abs) : "—"}${r.realized_gain_pct != null ? ` (${fmtPct(r.realized_gain_pct)})` : ""}</td>
+    </tr>`
+    )
+    .join("");
+}
+
 document.getElementById("holdingForm").addEventListener("submit", async (e) => {
   e.preventDefault();
   const errEl = document.getElementById("formError");
@@ -409,12 +548,14 @@ function showApp(user) {
   loadHoldings();
   loadValueHistory();
   loadRecentRuns();
+  loadRealizedGains();
   if (!window.__pollingStarted) {
     window.__pollingStarted = true;
     setInterval(() => {
       loadHoldings();
       loadValueHistory();
       loadRecentRuns();
+      loadRealizedGains();
     }, 5 * 60 * 1000); // refresh the view every 5 min from cache (not the API)
   }
 }

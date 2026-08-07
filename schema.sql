@@ -88,6 +88,35 @@ create table if not exists portfolio_value_history (
 );
 create unique index if not exists idx_portfolio_value_history_user_date on portfolio_value_history (user_id, date);
 
+-- ── realized_gains ───────────────────────────────────────────────────────────
+-- One row per "sell" event — a closed position, distinct from just deleting a
+-- holding. Deleting a holding discards it with no record (for fixing a data
+-- entry mistake); selling records what it went for and computes the gain.
+-- Supports partial sells: selling less than the full quantity reduces the
+-- source holding rather than removing it (see app.js sellForm handler).
+-- Same known limitation as unrealised gains: the buy-side conversion to base
+-- currency uses whatever FX rate is cached "now", not the rate on buy_date —
+-- documented in README, not fixed here (would need a historical FX lookup
+-- per holding's buy_date, same idea as history.js but not wired up for this).
+create table if not exists realized_gains (
+  id                 uuid primary key default gen_random_uuid(),
+  user_id            uuid not null references auth.users (id) on delete cascade,
+  ticker             text not null,
+  asset_type         text not null,
+  quantity           numeric not null check (quantity > 0),
+  buy_price          numeric not null,
+  buy_currency       text not null,
+  buy_date           date not null,
+  sell_price         numeric not null,
+  sell_currency      text not null,
+  sell_date          date not null,
+  base_currency      text not null,
+  realized_gain_abs  numeric,
+  realized_gain_pct  numeric,
+  created_at         timestamptz not null default now()
+);
+create index if not exists idx_realized_gains_user_date on realized_gains (user_id, sell_date desc);
+
 -- ── Row Level Security ──────────────────────────────────────────────────────
 -- NOTE: this project deviates here from the brief's agreed scope (Section 2:
 -- "single portfolio, no login, keep it simple") — it's a full multi-user app
@@ -105,12 +134,14 @@ alter table prices enable row level security;
 alter table fx_rates enable row level security;
 alter table daily_reports enable row level security;
 alter table portfolio_value_history enable row level security;
+alter table realized_gains enable row level security;
 
 create policy "users manage own holdings" on holdings for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
 create policy "authenticated read/write prices" on prices for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
 create policy "authenticated read/write fx_rates" on fx_rates for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
 create policy "users manage own daily_reports" on daily_reports for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
 create policy "users manage own portfolio_value_history" on portfolio_value_history for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+create policy "users manage own realized_gains" on realized_gains for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
 
 -- No seed data here on purpose: holdings now require a real user_id, and
 -- there's no user until someone signs up through the app. Sign up, then add

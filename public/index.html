@@ -107,6 +107,37 @@
       </table>
     </section>
 
+    <section class="sell-holding" id="sellSection" style="display: none">
+      <h2>Sell <span id="sellTicker"></span></h2>
+      <form id="sellForm">
+        <input name="sell_quantity" id="sellQuantityInput" type="number" step="any" min="0.000001" placeholder="Quantity to sell" required />
+        <input name="sell_price" type="number" step="any" min="0.000001" placeholder="Sell price" required />
+        <select name="sell_currency" id="sellCurrencySelect" required>
+          <option value="USD">USD</option>
+          <option value="EUR">EUR</option>
+          <option value="GBP">GBP</option>
+          <option value="JPY">JPY</option>
+          <option value="INR">INR</option>
+        </select>
+        <input name="sell_date" type="date" id="sellDateInput" required />
+        <button type="submit">Record sale</button>
+        <button type="button" id="cancelSellBtn">Cancel</button>
+      </form>
+      <p class="form-error" id="sellError"></p>
+    </section>
+
+    <section class="realized-gains">
+      <h2>Realized Gains</h2>
+      <table>
+        <thead>
+          <tr><th>Ticker</th><th>Qty</th><th>Buy Price</th><th>Sell Price</th><th>Sell Date</th><th>Gain/Loss</th></tr>
+        </thead>
+        <tbody id="realizedGainsBody">
+          <tr><td colspan="6">Loading…</td></tr>
+        </tbody>
+      </table>
+    </section>
+
     <section class="recent-runs">
       <h2>Recent Runs</h2>
       <table>
