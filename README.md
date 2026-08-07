@@ -67,7 +67,7 @@ public/            Front end — static HTML/CSS/JS, deployed to Cloudflare Page
 
 worker/             Backend — Cloudflare Worker with a Cron Trigger
   wrangler.toml     Worker config + cron schedule (UTC!)
-  src/index.js      Routes: scheduled job, /run, /status, /refresh-prices, /backfill-history
+  src/index.js      Routes: scheduled job, /run (+?user_id=), /status, /refresh-prices, /backfill-history, /search-symbols
   src/lib/
     supabase.js      Minimal PostgREST client (service_role key, bypasses RLS)
     prices.js         Twelve Data — batched quote fetch
@@ -110,6 +110,19 @@ support was added, those tables needed `user_id` added via `alter table`,
 existing rows backfilled to a real user, and RLS policies swapped from
 "any authenticated user" to "only this row's owner" — a one-time migration,
 not something `schema.sql` re-running would do for you on an existing table.
+The same is true for the later addition of **portfolios** (a new `portfolios`
+table + `holdings.portfolio_id`) — see the migration block at the bottom of
+`schema.sql` if you already have data.
+
+**Portfolios, scoped:** you can now group holdings into named portfolios
+(e.g. "Retirement", "Trading") and filter the dashboard by one, or view
+everything under "All portfolios". This filters the holdings table, the
+summary stats, and the allocation breakdown only — the **value-over-time
+chart, the daily email, and realized gains all stay whole-account**
+(every portfolio combined), by design, not an oversight. Splitting those
+per portfolio too (separate charts, separate emails) would be a much bigger
+rearchitecture than was asked for; this keeps portfolios a lightweight
+organizing/filtering layer instead.
 
 ### 1. Accounts (Section 3 of the brief)
 
@@ -179,7 +192,14 @@ npm run deploy
 ```
 Trigger a real run any time (useful for testing) by visiting
 `https://<your-worker>.workers.dev/run`, and check recent run history at
-`/status`.
+`/status`. There's also a **"Run now" button on the dashboard itself**
+(next to "Recent Runs") that hits `/run?user_id=<you>` — scoped to just your
+own holdings/email, unlike a bare `/run` which loops every signed-up user.
+
+Other endpoints added since the multi-user rewrite: `/search-symbols?q=...`
+(proxies Twelve Data's ticker search for the dashboard's autocomplete — keeps
+the API key server-side) and the existing `/refresh-prices` /
+`/backfill-history` pair.
 
 ### 5. Verify the maths (Day 4 — do not skip this)
 

@@ -85,11 +85,11 @@ async function loadHoldings() {
   const tbody = document.getElementById("holdingsBody");
   const { data: holdings, error } = await sb.from("holdings").select("*").order("created_at");
   if (error) {
-    tbody.innerHTML = `<tr><td colspan="10">Failed to load holdings: ${error.message}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="11">Failed to load holdings: ${error.message}</td></tr>`;
     return;
   }
   if (holdings.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="10">No holdings yet — add one below.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="11">No holdings yet — add one below.</td></tr>`;
     resetSummary();
     return;
   }
@@ -105,7 +105,17 @@ async function loadHoldings() {
   const missing = priceCurrencies.filter((c) => !(c in fxRates));
   if (missing.length) Object.assign(fxRates, await fetchLatestFx(missing).catch(() => ({})));
 
-  const rows = holdings.map((h) => ({ h, ...computeRow(h, prices[h.ticker], fxRates) }));
+  // Computed over EVERY holding regardless of the portfolio filter — this
+  // whole-account total is what feeds the chart (Day 15 scope decision: the
+  // value-over-time chart stays whole-account, only the table/summary/
+  // allocation below get filtered by portfolio).
+  const allRows = holdings.map((h) => ({ h, ...computeRow(h, prices[h.ticker], fxRates) }));
+  const wholeAccountValue = allRows.reduce((s, r) => s + (r.currentValue || 0), 0);
+
+  // Portfolios (Day 15): "All portfolios" shows everything; a specific
+  // selection filters down to just that portfolio's holdings for display.
+  const rows = selectedPortfolioId === "__all__" ? allRows : allRows.filter((r) => r.h.portfolio_id === selectedPortfolioId);
+
   const totalValue = rows.reduce((s, r) => s + (r.currentValue || 0), 0);
   const totalCost = rows.reduce((s, r) => s + (r.gainAbs != null && r.currentValue != null ? r.currentValue - r.gainAbs : 0), 0);
   const totalGainAbs = totalValue - totalCost;
@@ -135,10 +145,40 @@ async function loadHoldings() {
   // without a round trip — cheap since this is already the full list.
   window.__holdingsById = Object.fromEntries(holdings.map((h) => [h.id, h]));
 
+  // Keep today's chart point live: every time we recompute a real total (on
+  // load, after add/edit/sell/delete, or the 5-min poll), upsert it into
+  // portfolio_value_history so the chart never lags a full day behind — you
+  // don't have to wait for tomorrow's scheduled run just to see today's add
+  // reflected. Always the WHOLE-account value (not the filtered one) —
+  // portfolios don't get their own chart (see scope note above). RLS-scoped
+  // (auth.uid() = user_id), so this is safe from the browser with the anon
+  // key. Best-effort: a failure here shouldn't block the rest of the
+  // dashboard from rendering.
+  if (currentUserId && wholeAccountValue > 0) {
+    const todayStr = new Date().toISOString().slice(0, 10);
+    sb.from("portfolio_value_history")
+      .upsert(
+        { user_id: currentUserId, date: todayStr, total_value: wholeAccountValue, base_currency: BASE_CURRENCY, source: "live_update" },
+        { onConflict: "user_id,date" }
+      )
+      .then(({ error }) => {
+        if (error) console.warn("Could not update today's chart point:", error.message);
+        loadValueHistory();
+      });
+  }
+
+  if (rows.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="11">No holdings in this portfolio — add one below or switch to "All portfolios".</td></tr>`;
+    return;
+  }
+
+  const portfolioNameById = Object.fromEntries(allPortfolios.map((p) => [p.id, p.name]));
+
   tbody.innerHTML = rows
     .map(({ h, currentValue, gainPct, dayChangePct, priceInBase, isStale, isFund }) => `
     <tr>
       <td>${h.ticker}</td>
+      <td>${h.portfolio_id ? escapeHtml(portfolioNameById[h.portfolio_id] || "—") : '<span class="nav-tag">unassigned</span>'}</td>
       <td>${h.asset_type}</td>
       <td>${h.quantity}</td>
       <td>${fmtMoneyIn(h.buy_price, h.buy_currency)}</td>
@@ -365,6 +405,7 @@ function startEdit(h) {
   form.buy_price.value = h.buy_price;
   form.buy_currency.value = h.buy_currency;
   form.buy_date.value = h.buy_date;
+  form.portfolio_id.value = h.portfolio_id || "";
   document.getElementById("holdingFormTitle").textContent = `Edit ${h.ticker}`;
   document.getElementById("formSubmitBtn").textContent = "Save changes";
   document.getElementById("cancelEditBtn").style.display = "";
@@ -530,6 +571,245 @@ async function loadRealizedGains() {
     .join("");
 }
 
+// --- Portfolios: an optional grouping layer on top of holdings ------------
+// Scope decision (see README/schema.sql): portfolios filter the holdings
+// table, summary stats, and allocation only. The value chart, daily email,
+// and realized gains all stay whole-account — splitting those per portfolio
+// too would mean multiple emails/charts per user, out of scope here.
+let allPortfolios = [];
+let selectedPortfolioId = "__all__";
+
+async function loadPortfolios() {
+  const { data, error } = await sb.from("portfolios").select("*").order("created_at");
+  if (error) {
+    console.warn("Could not load portfolios:", error.message);
+    return;
+  }
+  allPortfolios = data || [];
+
+  const filterSelect = document.getElementById("portfolioFilterSelect");
+  const keepFilter = selectedPortfolioId;
+  filterSelect.innerHTML =
+    `<option value="__all__">All portfolios</option>` +
+    allPortfolios.map((p) => `<option value="${p.id}">${escapeHtml(p.name)}</option>`).join("");
+  // If the previously selected portfolio was deleted elsewhere, fall back to "All".
+  filterSelect.value = allPortfolios.some((p) => p.id === keepFilter) || keepFilter === "__all__" ? keepFilter : "__all__";
+  selectedPortfolioId = filterSelect.value;
+
+  const formSelect = document.getElementById("portfolioFormSelect");
+  formSelect.innerHTML =
+    `<option value="">No portfolio</option>` + allPortfolios.map((p) => `<option value="${p.id}">${escapeHtml(p.name)}</option>`).join("");
+  setPortfolioFormDefault();
+
+  updatePortfolioBarButtons();
+}
+
+// When adding a new holding, default its portfolio to whichever one you're
+// currently filtered to — you're almost always adding to the portfolio
+// you're looking at. Only applies when not mid-edit (startEdit sets its own value after this runs).
+function setPortfolioFormDefault() {
+  if (editingHoldingId) return;
+  const formSelect = document.getElementById("portfolioFormSelect");
+  formSelect.value = selectedPortfolioId === "__all__" ? "" : selectedPortfolioId;
+}
+
+function updatePortfolioBarButtons() {
+  const hasSelection = selectedPortfolioId !== "__all__";
+  document.getElementById("renamePortfolioBtn").style.display = hasSelection ? "" : "none";
+  document.getElementById("deletePortfolioBtn").style.display = hasSelection ? "" : "none";
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+document.getElementById("portfolioFilterSelect").addEventListener("change", (e) => {
+  selectedPortfolioId = e.target.value;
+  updatePortfolioBarButtons();
+  setPortfolioFormDefault();
+  loadHoldings();
+});
+
+document.getElementById("newPortfolioBtn").addEventListener("click", async () => {
+  const name = prompt("Name this portfolio (e.g. Retirement, Trading):");
+  if (!name || !name.trim()) return;
+  const { data, error } = await sb.from("portfolios").insert({ user_id: currentUserId, name: name.trim() }).select().single();
+  if (error) {
+    alert(`Could not create portfolio: ${error.message}`);
+    return;
+  }
+  await loadPortfolios();
+  document.getElementById("portfolioFilterSelect").value = data.id;
+  selectedPortfolioId = data.id;
+  updatePortfolioBarButtons();
+  setPortfolioFormDefault();
+  loadHoldings();
+});
+
+document.getElementById("renamePortfolioBtn").addEventListener("click", async () => {
+  if (selectedPortfolioId === "__all__") return;
+  const current = allPortfolios.find((p) => p.id === selectedPortfolioId);
+  const name = prompt("Rename portfolio:", current?.name || "");
+  if (!name || !name.trim()) return;
+  const { error } = await sb.from("portfolios").update({ name: name.trim() }).eq("id", selectedPortfolioId);
+  if (error) {
+    alert(`Could not rename portfolio: ${error.message}`);
+    return;
+  }
+  loadPortfolios();
+});
+
+document.getElementById("deletePortfolioBtn").addEventListener("click", async () => {
+  if (selectedPortfolioId === "__all__") return;
+  const current = allPortfolios.find((p) => p.id === selectedPortfolioId);
+  if (!confirm(`Delete portfolio "${current?.name}"? Its holdings are NOT deleted — they just become unassigned and stay visible under "All portfolios".`)) return;
+  const { error } = await sb.from("portfolios").delete().eq("id", selectedPortfolioId);
+  if (error) {
+    alert(`Could not delete portfolio: ${error.message}`);
+    return;
+  }
+  selectedPortfolioId = "__all__";
+  await loadPortfolios();
+  loadHoldings();
+});
+
+// --- Ticker search/autocomplete --------------------------------------------
+// Proxies through the Worker (worker/src/index.js /search-symbols) so the
+// Twelve Data API key stays server-side — same principle as never calling
+// the price API directly from the browser.
+let tickerSearchDebounce = null;
+let tickerSearchActiveIndex = -1;
+let tickerSearchResults = [];
+
+function renderTickerSuggestions(results) {
+  tickerSearchResults = results;
+  tickerSearchActiveIndex = -1;
+  const list = document.getElementById("tickerSuggestions");
+  if (!results.length) {
+    list.style.display = "none";
+    list.innerHTML = "";
+    return;
+  }
+  list.innerHTML = results
+    .map(
+      (r, i) => `
+    <li data-index="${i}">
+      <span class="sym">${escapeHtml(r.symbol)}</span>
+      <span class="name">${escapeHtml(r.name || "")}${r.exchange ? ` · ${escapeHtml(r.exchange)}` : ""}</span>
+    </li>`
+    )
+    .join("");
+  list.style.display = "";
+  list.querySelectorAll("li").forEach((li) =>
+    li.addEventListener("mousedown", (e) => {
+      e.preventDefault(); // fire before the input's blur hides the list
+      selectTickerSuggestion(Number(li.dataset.index));
+    })
+  );
+}
+
+function selectTickerSuggestion(index) {
+  const r = tickerSearchResults[index];
+  if (!r) return;
+  const tickerInput = document.getElementById("tickerInput");
+  tickerInput.value = r.symbol;
+  // Best-effort: default the currency dropdown to match the exchange's
+  // currency if it's one of the options we support.
+  const form = document.getElementById("holdingForm");
+  if (r.currency && [...form.buy_currency.options].some((o) => o.value === r.currency)) {
+    form.buy_currency.value = r.currency;
+  }
+  if (r.type && /etf/i.test(r.type)) form.asset_type.value = "etf";
+  else if (r.type && /fund/i.test(r.type)) form.asset_type.value = "fund";
+  else if (r.type && /(common stock|equity)/i.test(r.type)) form.asset_type.value = "stock";
+  document.getElementById("tickerSuggestions").style.display = "none";
+}
+
+const tickerInputEl = document.getElementById("tickerInput");
+tickerInputEl.addEventListener("input", () => {
+  const q = tickerInputEl.value.trim();
+  clearTimeout(tickerSearchDebounce);
+  if (q.length < 1 || !window.WORKER_URL) {
+    renderTickerSuggestions([]);
+    return;
+  }
+  tickerSearchDebounce = setTimeout(async () => {
+    try {
+      const res = await fetch(`${window.WORKER_URL}/search-symbols?q=${encodeURIComponent(q)}`);
+      const json = await res.json();
+      renderTickerSuggestions(json.data || []);
+    } catch (err) {
+      console.warn("Ticker search failed:", err.message);
+    }
+  }, 300);
+});
+
+tickerInputEl.addEventListener("keydown", (e) => {
+  const list = document.getElementById("tickerSuggestions");
+  if (list.style.display === "none" || !tickerSearchResults.length) return;
+  if (e.key === "ArrowDown") {
+    e.preventDefault();
+    tickerSearchActiveIndex = Math.min(tickerSearchActiveIndex + 1, tickerSearchResults.length - 1);
+  } else if (e.key === "ArrowUp") {
+    e.preventDefault();
+    tickerSearchActiveIndex = Math.max(tickerSearchActiveIndex - 1, 0);
+  } else if (e.key === "Enter" && tickerSearchActiveIndex >= 0) {
+    e.preventDefault();
+    selectTickerSuggestion(tickerSearchActiveIndex);
+    return;
+  } else if (e.key === "Escape") {
+    renderTickerSuggestions([]);
+    return;
+  } else {
+    return;
+  }
+  list.querySelectorAll("li").forEach((li, i) => li.classList.toggle("active", i === tickerSearchActiveIndex));
+});
+
+tickerInputEl.addEventListener("blur", () => {
+  setTimeout(() => renderTickerSuggestions([]), 150); // delay so a click on a suggestion still registers
+});
+
+// --- Manual "Run now" button ------------------------------------------------
+// Wires the Worker's /run?user_id= endpoint (scoped to just this user — see
+// worker/src/index.js runDailyJobForUser) to a button instead of requiring
+// curl. Sends a real email and writes a real Recent Runs row, same as a
+// scheduled run would for this account.
+document.getElementById("runNowBtn").addEventListener("click", async () => {
+  const btn = document.getElementById("runNowBtn");
+  const statusEl = document.getElementById("runNowStatus");
+  if (!currentUserId || !window.WORKER_URL) return;
+
+  btn.disabled = true;
+  btn.textContent = "Running…";
+  statusEl.className = "run-now-status";
+  statusEl.textContent = "Refreshing prices and sending your daily email now — this can take a few seconds…";
+
+  try {
+    const res = await fetch(`${window.WORKER_URL}/run?user_id=${encodeURIComponent(currentUserId)}`);
+    const result = await res.json();
+    if (result.status === "completed" && result.user?.status !== "failed") {
+      statusEl.className = "run-now-status positive";
+      statusEl.textContent = `Done — email sent (${result.user?.status || "sent"}), took ${(result.duration_ms / 1000).toFixed(1)}s.`;
+    } else if (result.status === "skipped") {
+      statusEl.className = "run-now-status";
+      statusEl.textContent = `Skipped: ${result.reason}`;
+    } else {
+      statusEl.className = "run-now-status negative";
+      statusEl.textContent = `Failed: ${result.error || result.user?.error || "unknown error"}`;
+    }
+  } catch (err) {
+    statusEl.className = "run-now-status negative";
+    statusEl.textContent = `Could not reach the Worker: ${err.message}`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Run now";
+    loadHoldings();
+    loadValueHistory();
+    loadRecentRuns();
+  }
+});
+
 document.getElementById("holdingForm").addEventListener("submit", async (e) => {
   e.preventDefault();
   const errEl = document.getElementById("formError");
@@ -546,6 +826,7 @@ document.getElementById("holdingForm").addEventListener("submit", async (e) => {
     buy_price: Number(form.get("buy_price")),
     buy_currency: form.get("buy_currency"),
     buy_date: form.get("buy_date"),
+    portfolio_id: form.get("portfolio_id") || null,
   };
   if (!payload.ticker) return (errEl.textContent = "Ticker is required.");
   if (!(payload.quantity > 0)) return (errEl.textContent = "Quantity must be positive.");
@@ -560,6 +841,7 @@ document.getElementById("holdingForm").addEventListener("submit", async (e) => {
     stopEdit();
     e.target.reset();
     setDateToToday();
+    setPortfolioFormDefault();
     loadHoldings();
     await triggerPriceRefresh(); // ticker may have changed
     loadHoldings();
@@ -574,6 +856,7 @@ document.getElementById("holdingForm").addEventListener("submit", async (e) => {
   }
   e.target.reset();
   setDateToToday(); // form.reset() clears the date field back to blank — refill it
+  setPortfolioFormDefault(); // form.reset() also clears this back to "No portfolio" — refill from the active filter
   loadHoldings(); // show the new row immediately (price will say "no data" until the refresh below lands)
   await triggerPriceRefresh();
   loadHoldings(); // reload once the Worker has cached a price for the new ticker
@@ -622,13 +905,14 @@ function showApp(user) {
   document.getElementById("loginSection").style.display = "none";
   document.getElementById("appContent").style.display = "";
   setDateToToday();
-  loadHoldings();
+  loadPortfolios().then(loadHoldings);
   loadValueHistory();
   loadRecentRuns();
   loadRealizedGains();
   if (!window.__pollingStarted) {
     window.__pollingStarted = true;
     setInterval(() => {
+      loadPortfolios();
       loadHoldings();
       loadValueHistory();
       loadRecentRuns();

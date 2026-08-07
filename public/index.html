@@ -31,6 +31,17 @@
       <button type="button" id="signOutBtn" class="del-btn">Sign out</button>
     </header>
 
+    <section class="portfolio-bar" id="portfolioBar">
+      <label for="portfolioFilterSelect">Portfolio</label>
+      <select id="portfolioFilterSelect">
+        <option value="__all__">All portfolios</option>
+      </select>
+      <button type="button" id="newPortfolioBtn">+ New portfolio</button>
+      <button type="button" id="renamePortfolioBtn" style="display: none">Rename</button>
+      <button type="button" id="deletePortfolioBtn" class="del-btn" style="display: none">Delete</button>
+    </section>
+    <p class="portfolio-bar-note" id="portfolioBarNote">Filtering the holdings table, summary, and allocation below. The value chart, daily email, and realized gains stay whole-account.</p>
+
     <section class="summary" id="summary">
       <div class="stat">
         <span class="label">Total value</span>
@@ -73,7 +84,11 @@
     <section class="add-holding">
       <h2 id="holdingFormTitle">Add a holding</h2>
       <form id="holdingForm">
-        <input name="ticker" id="tickerInput" placeholder="Ticker (e.g. AAPL)" required maxlength="10" />
+        <div class="ticker-search-wrap">
+          <input name="ticker" id="tickerInput" placeholder="Ticker (e.g. AAPL)" required maxlength="10" autocomplete="off" />
+          <ul id="tickerSuggestions" class="ticker-suggestions" style="display: none"></ul>
+        </div>
+        <select name="portfolio_id" id="portfolioFormSelect"></select>
         <select name="asset_type" required>
           <option value="stock">Stock</option>
           <option value="etf">ETF</option>
@@ -101,12 +116,12 @@
       <table>
         <thead>
           <tr>
-            <th>Ticker</th><th>Type</th><th>Qty</th><th>Buy Price</th><th>Current Price</th><th>Value</th>
+            <th>Ticker</th><th>Portfolio</th><th>Type</th><th>Qty</th><th>Buy Price</th><th>Current Price</th><th>Value</th>
             <th>Day %</th><th>Gain/Loss %</th><th>Weight</th><th></th>
           </tr>
         </thead>
         <tbody id="holdingsBody">
-          <tr><td colspan="10">Loading…</td></tr>
+          <tr><td colspan="11">Loading…</td></tr>
         </tbody>
       </table>
     </section>
@@ -143,7 +158,10 @@
     </section>
 
     <section class="recent-runs">
-      <h2>Recent Runs</h2>
+      <h2>Recent Runs
+        <button type="button" id="runNowBtn" class="run-now-btn">Run now</button>
+      </h2>
+      <p class="run-now-status" id="runNowStatus"></p>
       <table>
         <thead>
           <tr><th>Date</th><th>Status</th><th>Duration</th><th>Value</th><th>Error</th></tr>

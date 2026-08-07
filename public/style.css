@@ -106,3 +106,44 @@ header h1 { flex: 1; }
   border-radius: 10px;
 }
 .chart-caption { color: var(--muted); font-size: 0.8rem; margin-top: 6px; }
+
+.recent-runs h2 { display: flex; align-items: center; gap: 12px; }
+.run-now-btn { font-size: 0.8rem; padding: 4px 10px; }
+.run-now-status { color: var(--muted); font-size: 0.8rem; margin: -8px 0 12px; }
+.run-now-status.positive { color: var(--green); }
+.run-now-status.negative { color: var(--red); }
+
+.ticker-search-wrap { position: relative; }
+.ticker-suggestions {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 20;
+  list-style: none;
+  margin: 2px 0 0;
+  padding: 4px;
+  min-width: 260px;
+  max-height: 260px;
+  overflow-y: auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+.ticker-suggestions li {
+  padding: 6px 8px;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 0.85rem;
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+.ticker-suggestions li:hover, .ticker-suggestions li.active { background: var(--border); }
+.ticker-suggestions .sym { font-weight: 600; }
+.ticker-suggestions .name { color: var(--muted); font-size: 0.78rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 160px; }
+
+.portfolio-bar { display: flex; align-items: center; gap: 10px; margin: 20px 0 4px; flex-wrap: wrap; }
+.portfolio-bar label { color: var(--muted); font-size: 0.85rem; }
+.portfolio-bar-note { color: var(--muted); font-size: 0.78rem; margin: 0 0 20px; }
+#renamePortfolioBtn, #deletePortfolioBtn, #newPortfolioBtn { font-size: 0.8rem; padding: 6px 10px; }

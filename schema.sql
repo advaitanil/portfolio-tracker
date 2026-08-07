@@ -14,9 +14,32 @@ create table if not exists holdings (
   buy_price    numeric not null check (buy_price > 0),
   buy_currency text not null default 'USD',
   buy_date     date not null,
+  -- Nullable on purpose: a holding with no portfolio_id is "unassigned" and
+  -- still shows up under "All portfolios". Deleting a portfolio sets this
+  -- back to null rather than cascading — you lose the grouping, never the
+  -- holding itself.
+  portfolio_id uuid references portfolios (id) on delete set null,
   created_at   timestamptz not null default now()
 );
 create index if not exists idx_holdings_user on holdings (user_id);
+create index if not exists idx_holdings_portfolio on holdings (portfolio_id);
+
+-- ── portfolios ──────────────────────────────────────────────────────────────
+-- Optional grouping layer on top of holdings — e.g. "Retirement", "Trading".
+-- Deliberately lightweight: a portfolio is just a name a user's holdings can
+-- point at. Scope decision (see README): portfolios filter the dashboard's
+-- holdings table/summary/allocation only. The value-over-time chart, the
+-- daily email, and realized gains all stay whole-account (every portfolio
+-- combined), same as before this feature — splitting those per portfolio too
+-- would mean multiple emails/charts per user, a much bigger rearchitecture
+-- that wasn't asked for.
+create table if not exists portfolios (
+  id         uuid primary key default gen_random_uuid(),
+  user_id    uuid not null references auth.users (id) on delete cascade,
+  name       text not null,
+  created_at timestamptz not null default now()
+);
+create index if not exists idx_portfolios_user on portfolios (user_id);
 
 -- ── prices ──────────────────────────────────────────────────────────────────
 -- Cached price snapshots. We APPEND a new row every refresh (never overwrite)
@@ -130,12 +153,14 @@ create index if not exists idx_realized_gains_user_date on realized_gains (user_
 -- always bypasses RLS entirely (it has to — it writes on behalf of every
 -- user in one run), so none of this affects the scheduled job itself.
 alter table holdings enable row level security;
+alter table portfolios enable row level security;
 alter table prices enable row level security;
 alter table fx_rates enable row level security;
 alter table daily_reports enable row level security;
 alter table portfolio_value_history enable row level security;
 alter table realized_gains enable row level security;
 
+create policy "users manage own portfolios" on portfolios for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
 create policy "users manage own holdings" on holdings for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
 create policy "authenticated read/write prices" on prices for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
 create policy "authenticated read/write fx_rates" on fx_rates for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
@@ -146,3 +171,28 @@ create policy "users manage own realized_gains" on realized_gains for all using 
 -- No seed data here on purpose: holdings now require a real user_id, and
 -- there's no user until someone signs up through the app. Sign up, then add
 -- your first 3 test holdings through the dashboard form.
+
+-- ── Migration: adding portfolios to an existing (already-deployed) database ─
+-- This whole file is written for a fresh project. If your `holdings` table
+-- already has data, re-running it does nothing to that existing table (the
+-- `create table if not exists` is a no-op) and it will NOT add the new
+-- portfolio_id column for you. Run just this block once instead:
+--
+--   create table if not exists portfolios (
+--     id         uuid primary key default gen_random_uuid(),
+--     user_id    uuid not null references auth.users (id) on delete cascade,
+--     name       text not null,
+--     created_at timestamptz not null default now()
+--   );
+--   create index if not exists idx_portfolios_user on portfolios (user_id);
+--   alter table portfolios enable row level security;
+--   create policy "users manage own portfolios" on portfolios for all
+--     using (auth.uid() = user_id) with check (auth.uid() = user_id);
+--
+--   alter table holdings add column if not exists portfolio_id uuid
+--     references portfolios (id) on delete set null;
+--   create index if not exists idx_holdings_portfolio on holdings (portfolio_id);
+--
+-- Existing holdings will have portfolio_id = null, which the dashboard shows
+-- as "unassigned" and always includes under "All portfolios" — nothing is
+-- hidden by this migration.

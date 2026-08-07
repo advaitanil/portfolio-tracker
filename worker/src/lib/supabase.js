@@ -41,6 +41,15 @@ export function makeSupabase(env) {
       return json.users || [];
     },
 
+    // Single-user lookup for the "Run now" button (runDailyJobForUser) — same
+    // GoTrue admin API as listUsers, just one user instead of the full page.
+    getUserById: async (id) => {
+      const res = await fetch(`${env.SUPABASE_URL}/auth/v1/admin/users/${id}`, { headers: authHeaders });
+      if (res.status === 404) return null;
+      if (!res.ok) throw new Error(`Supabase admin getUserById failed: ${res.status} ${await res.text().catch(() => "")}`);
+      return res.json();
+    },
+
     insertRows: (table, rows) =>
       req(`/${table}`, { method: "POST", headers: { Prefer: "return=minimal" }, body: JSON.stringify(rows) }),
 

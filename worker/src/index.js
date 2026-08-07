@@ -42,8 +42,13 @@ export default {
     if (req.method === "OPTIONS") return new Response(null, { headers: CORS_HEADERS });
 
     if (url.pathname === "/run") {
-      const result = await runDailyJob(env);
-      return Response.json(result);
+      // Optional ?user_id= scopes the run to just one person (Day 15's
+      // "Run now" dashboard button) instead of the full cron job, which
+      // loops every signed-up user and emails each of them. CORS'd since the
+      // front end calls this directly from the browser.
+      const userId = url.searchParams.get("user_id");
+      const result = userId ? await runDailyJobForUser(env, userId) : await runDailyJob(env);
+      return Response.json(result, { headers: CORS_HEADERS });
     }
     if (url.pathname === "/status") {
       const userId = url.searchParams.get("user_id");
@@ -60,9 +65,43 @@ export default {
       const result = await backfillHistory(env);
       return Response.json(result, { headers: CORS_HEADERS });
     }
-    return new Response("Portfolio Tracker Worker. Try /run, /status?user_id=..., /refresh-prices, or /backfill-history.", { status: 200 });
+    if (url.pathname === "/search-symbols") {
+      const q = url.searchParams.get("q") || "";
+      const result = await searchSymbols(q, env);
+      return Response.json(result, { headers: CORS_HEADERS });
+    }
+    return new Response(
+      "Portfolio Tracker Worker. Try /run, /run?user_id=..., /status?user_id=..., /refresh-prices, /backfill-history, or /search-symbols?q=...",
+      { status: 200 }
+    );
   },
 };
+
+// Ticker autocomplete (Day 15): proxies Twelve Data's symbol_search so the
+// API key never has to live in the browser. The front end debounces calls to
+// this as the user types in the ticker field. Trimmed down to just what the
+// dropdown needs — Twelve Data's raw response has more fields than we use.
+async function searchSymbols(query, env) {
+  const q = query.trim();
+  if (q.length < 1) return { data: [] };
+  try {
+    const url = `https://api.twelvedata.com/symbol_search?symbol=${encodeURIComponent(q)}&apikey=${env.TWELVE_DATA_API_KEY}`;
+    const res = await fetch(url);
+    const json = await res.json();
+    if (json?.status === "error") return { data: [], error: json.message || "search failed" };
+    const rows = (json.data || []).slice(0, 12).map((r) => ({
+      symbol: r.symbol,
+      name: r.instrument_name,
+      exchange: r.exchange,
+      type: r.instrument_type,
+      currency: r.currency,
+      country: r.country,
+    }));
+    return { data: rows };
+  } catch (err) {
+    return { data: [], error: err.message };
+  }
+}
 
 // Cache-only refresh — no email, no daily_reports row. This is what the front
 // end calls right after you add a holding, so you're not stuck waiting for
@@ -160,6 +199,52 @@ async function backfillHistory(env) {
   }
 }
 
+// Shared by the full cron job, the single-user "Run now" button, and (in
+// spirit) /refresh-prices: fetch fresh prices + today's/yesterday's FX for
+// whatever set of holdings it's given, and cache the results. Pulled out into
+// one place so all three callers stay consistent instead of drifting.
+async function refreshSharedPriceFxCache(env, sb, holdings, baseCurrency) {
+  const tickers = [...new Set(holdings.map((h) => h.ticker))];
+  const priceCurrenciesNeeded = [...new Set(holdings.map((h) => h.buy_currency))];
+  const priceResults = await fetchPrices(tickers, env);
+  const currenciesInPrices = Object.values(priceResults).map((p) => p.currency).filter(Boolean);
+  const allQuoteCurrencies = [...new Set([...priceCurrenciesNeeded, ...currenciesInPrices])];
+  const fxRatesToday = await fetchFxRates(baseCurrency, allQuoteCurrencies);
+
+  const nowIso = new Date().toISOString();
+  // Yesterday's FX snapshot, per quote currency, for the price-vs-FX return split (Day 12).
+  const fxRatesYesterday = {};
+  for (const q of allQuoteCurrencies) {
+    if (q === baseCurrency) continue;
+    fxRatesYesterday[q] = await sb.getFxRateBefore(baseCurrency, q, nowIso).catch(() => null);
+  }
+
+  // Cache what we fetched — write-through, append-only, shared across all users.
+  await sb
+    .insertRows(
+      "prices",
+      tickers.map((t) => ({
+        ticker: t,
+        price: priceResults[t]?.price ?? null,
+        previous_close: priceResults[t]?.previous_close ?? null,
+        currency: priceResults[t]?.currency ?? null,
+        source: priceResults[t]?.source ?? "twelvedata",
+        is_stale: priceResults[t]?.is_stale ?? true,
+        error: priceResults[t]?.error ?? null,
+      }))
+    )
+    .catch((e) => console.error("Failed to cache prices (continuing anyway):", e.message));
+
+  await sb
+    .insertRows(
+      "fx_rates",
+      Object.entries(fxRatesToday).map(([quote, rate]) => ({ base: baseCurrency, quote, rate }))
+    )
+    .catch((e) => console.error("Failed to cache FX rates (continuing anyway):", e.message));
+
+  return { priceResults, fxRatesToday, fxRatesYesterday };
+}
+
 async function runDailyJob(env) {
   const startedAt = Date.now();
   const baseCurrency = env.BASE_CURRENCY || "USD";
@@ -172,43 +257,7 @@ async function runDailyJob(env) {
     const users = await sb.listUsers();
 
     // --- Shared price/FX refresh, once for the union of every user's tickers ---
-    const tickers = [...new Set(allHoldings.map((h) => h.ticker))];
-    const priceCurrenciesNeeded = [...new Set(allHoldings.map((h) => h.buy_currency))];
-    const priceResults = await fetchPrices(tickers, env);
-    const currenciesInPrices = Object.values(priceResults).map((p) => p.currency).filter(Boolean);
-    const allQuoteCurrencies = [...new Set([...priceCurrenciesNeeded, ...currenciesInPrices])];
-    const fxRatesToday = await fetchFxRates(baseCurrency, allQuoteCurrencies);
-
-    const nowIso = new Date().toISOString();
-    // Yesterday's FX snapshot, per quote currency, for the price-vs-FX return split (Day 12).
-    const fxRatesYesterday = {};
-    for (const q of allQuoteCurrencies) {
-      if (q === baseCurrency) continue;
-      fxRatesYesterday[q] = await sb.getFxRateBefore(baseCurrency, q, nowIso).catch(() => null);
-    }
-
-    // Cache what we fetched — write-through, append-only, shared across all users.
-    await sb
-      .insertRows(
-        "prices",
-        tickers.map((t) => ({
-          ticker: t,
-          price: priceResults[t]?.price ?? null,
-          previous_close: priceResults[t]?.previous_close ?? null,
-          currency: priceResults[t]?.currency ?? null,
-          source: priceResults[t]?.source ?? "twelvedata",
-          is_stale: priceResults[t]?.is_stale ?? true,
-          error: priceResults[t]?.error ?? null,
-        }))
-      )
-      .catch((e) => console.error("Failed to cache prices (continuing anyway):", e.message));
-
-    await sb
-      .insertRows(
-        "fx_rates",
-        Object.entries(fxRatesToday).map(([quote, rate]) => ({ base: baseCurrency, quote, rate }))
-      )
-      .catch((e) => console.error("Failed to cache FX rates (continuing anyway):", e.message));
+    const { priceResults, fxRatesToday, fxRatesYesterday } = await refreshSharedPriceFxCache(env, sb, allHoldings, baseCurrency);
 
     // --- Per-user: metrics, news, commentary, email, logging ---
     const results = [];
@@ -226,6 +275,34 @@ async function runDailyJob(env) {
     // this is the one case that still goes to the single ops alert address.
     console.error("Daily job failed at the shared stage:", err);
     await sendFailureAlert(err, env).catch((e) => console.error("Failure alert itself failed to send:", e.message));
+    return { status: "failed", error: err.message, duration_ms: Date.now() - startedAt };
+  }
+}
+
+// Day 15's "Run now" button: the same job as runDailyJob, but scoped to one
+// user's own holdings/tickers only — it does NOT touch or email anyone else,
+// unlike hitting /run with no user_id. This DOES send a real email to that
+// one user (it's a genuine on-demand run of their daily job, not a dry run),
+// and writes a real daily_reports row so it shows up in "Recent Runs".
+async function runDailyJobForUser(env, userId) {
+  const startedAt = Date.now();
+  const baseCurrency = env.BASE_CURRENCY || "USD";
+  const sb = makeSupabase(env);
+
+  try {
+    const allHoldings = await sb.getHoldings();
+    const holdings = allHoldings.filter((h) => h.user_id === userId);
+    if (!holdings.length) return { status: "skipped", reason: "no holdings for this user yet" };
+
+    const user = await sb.getUserById(userId);
+    if (!user) return { status: "failed", error: "no user found for that id" };
+
+    const { priceResults, fxRatesToday, fxRatesYesterday } = await refreshSharedPriceFxCache(env, sb, holdings, baseCurrency);
+    const result = await processUserDailyJob({ user, holdings, priceResults, fxRatesToday, fxRatesYesterday, baseCurrency, sb, env });
+
+    return { status: "completed", duration_ms: Date.now() - startedAt, user: result };
+  } catch (err) {
+    console.error(`Manual run failed for user ${userId}:`, err);
     return { status: "failed", error: err.message, duration_ms: Date.now() - startedAt };
   }
 }
