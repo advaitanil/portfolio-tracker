@@ -71,6 +71,17 @@ button:hover { opacity: 0.9; }
 table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
 th { color: var(--muted); font-weight: 500; font-size: 0.8rem; text-transform: uppercase; }
+th[data-sort] { cursor: pointer; user-select: none; white-space: nowrap; }
+th[data-sort]:hover { color: var(--text); }
+th[data-sort].sorted { color: var(--accent); }
+th[data-sort] .sort-arrow { margin-left: 3px; font-size: 0.7rem; }
+
+.holdings-search {
+  width: 100%;
+  max-width: 260px;
+  margin-bottom: 10px;
+  display: block;
+}
 .stale { color: var(--red); font-size: 0.75rem; margin-left: 6px; }
 .nav-tag { color: var(--muted); font-size: 0.7rem; margin-left: 6px; border: 1px solid var(--border); border-radius: 4px; padding: 1px 4px; }
 .del-btn, .edit-btn, .sell-btn, #cancelEditBtn, #cancelSellBtn { background: transparent; border: 1px solid var(--border); color: var(--muted); cursor: pointer; font-weight: 500; }
@@ -98,6 +109,19 @@ footer { margin-top: 40px; color: var(--muted); font-size: 0.75rem; border-top: 
 header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
 header h1 { flex: 1; }
 
+.chart-range-buttons { display: flex; gap: 6px; margin-bottom: 10px; }
+.chart-range-buttons button {
+  font-size: 0.78rem;
+  padding: 4px 12px;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-weight: 500;
+}
+.chart-range-buttons button.active { background: var(--accent); color: #0b0d12; border-color: var(--accent); }
+.chart-range-buttons button:hover:not(.active) { color: var(--text); border-color: var(--text); }
+
+.chart-wrap { position: relative; max-width: 900px; }
 .chart-section svg {
   width: 100%;
   height: 260px;
@@ -105,6 +129,20 @@ header h1 { flex: 1; }
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 10px;
+  cursor: crosshair;
+}
+.chart-tooltip {
+  position: absolute;
+  transform: translate(-50%, -125%);
+  background: #0b0d12;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 9px;
+  font-size: 0.78rem;
+  color: var(--text);
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 5;
 }
 .chart-caption { color: var(--muted); font-size: 0.8rem; margin-top: 6px; }
 
@@ -148,3 +186,28 @@ header h1 { flex: 1; }
 .portfolio-bar label { color: var(--muted); font-size: 0.85rem; }
 .portfolio-bar-note { color: var(--muted); font-size: 0.78rem; margin: 0 0 20px; }
 #renamePortfolioBtn, #deletePortfolioBtn, #newPortfolioBtn { font-size: 0.8rem; padding: 6px 10px; }
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+  padding: 16px;
+}
+.modal-box {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px 22px;
+  max-width: 380px;
+  width: 100%;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+}
+.modal-box h3 { margin: 0 0 8px; font-size: 1.05rem; }
+.modal-box p { margin: 0 0 14px; color: var(--muted); font-size: 0.88rem; line-height: 1.4; }
+.modal-box input { width: 100%; margin-bottom: 14px; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.modal-actions .danger { background: var(--red); color: #1a0d0d; }

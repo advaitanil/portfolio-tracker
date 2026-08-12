@@ -26,6 +26,69 @@ const fmtMoneyIn = (n, currency) =>
 const fmtPct = (n) => (n == null || Number.isNaN(n) ? "—" : `${n >= 0 ? "+" : ""}${n.toFixed(2)}%`);
 const pctClass = (n) => (n == null || Number.isNaN(n) ? "" : n >= 0 ? "positive" : "negative");
 
+// In-app replacement for prompt()/confirm()/alert() — styled to match the
+// dashboard instead of a native browser dialog. Promise-based so call sites
+// can just `await showModal(...)` in place of the old synchronous calls.
+//   type: "prompt"  -> resolves the trimmed input string, or null if cancelled/empty
+//   type: "confirm" -> resolves true/false
+//   type: "alert"   -> resolves undefined once dismissed (no Cancel button)
+function showModal({ type = "alert", title = "", message = "", placeholder = "", defaultValue = "", danger = false, confirmLabel, cancelLabel = "Cancel" } = {}) {
+  return new Promise((resolve) => {
+    const overlay = document.getElementById("modalOverlay");
+    const titleEl = document.getElementById("modalTitle");
+    const messageEl = document.getElementById("modalMessage");
+    const inputEl = document.getElementById("modalInput");
+    const cancelBtn = document.getElementById("modalCancelBtn");
+    const confirmBtn = document.getElementById("modalConfirmBtn");
+
+    titleEl.textContent = title;
+    messageEl.textContent = message;
+    messageEl.style.display = message ? "" : "none";
+    inputEl.style.display = type === "prompt" ? "" : "none";
+    inputEl.value = defaultValue;
+    inputEl.placeholder = placeholder;
+    cancelBtn.style.display = type === "alert" ? "none" : "";
+    cancelBtn.textContent = cancelLabel;
+    confirmBtn.textContent = confirmLabel || (type === "confirm" ? "Confirm" : type === "prompt" ? "Save" : "OK");
+    confirmBtn.className = danger ? "del-btn" : "";
+
+    function cleanup(result) {
+      overlay.style.display = "none";
+      confirmBtn.removeEventListener("click", onConfirm);
+      cancelBtn.removeEventListener("click", onCancel);
+      overlay.removeEventListener("keydown", onKeydown);
+      overlay.removeEventListener("mousedown", onBackdrop);
+      resolve(result);
+    }
+    function onConfirm() {
+      cleanup(type === "prompt" ? inputEl.value.trim() || null : true);
+    }
+    function onCancel() {
+      cleanup(type === "prompt" ? null : false);
+    }
+    function onKeydown(e) {
+      if (e.key === "Escape") onCancel();
+      else if (e.key === "Enter") onConfirm();
+    }
+    function onBackdrop(e) {
+      if (e.target === overlay) onCancel();
+    }
+
+    confirmBtn.addEventListener("click", onConfirm);
+    cancelBtn.addEventListener("click", onCancel);
+    overlay.addEventListener("keydown", onKeydown);
+    overlay.addEventListener("mousedown", onBackdrop);
+
+    overlay.style.display = "flex";
+    if (type === "prompt") {
+      inputEl.focus();
+      inputEl.select();
+    } else {
+      confirmBtn.focus();
+    }
+  });
+}
+
 async function fetchLatestPrices(tickers) {
   if (tickers.length === 0) return {};
   const { data, error } = await sb
@@ -191,9 +254,75 @@ async function loadHoldings() {
     }
   }
 
+  lastHoldingsRows = rows;
+  lastHoldingsTotalValue = totalValue;
+  renderHoldingsTable();
+}
+
+// Sort/search (Day 17) operate entirely on the last-computed rows — no
+// refetch, since prices/rows are already in memory from loadHoldings above.
+let lastHoldingsRows = [];
+let lastHoldingsTotalValue = 0;
+let holdingsSearchTerm = "";
+let holdingsSortColumn = null;
+let holdingsSortDirection = 1; // 1 = ascending, -1 = descending
+
+function holdingsSortValue(row, col) {
+  const { h, currentValue, gainPct, dayChangePct, priceInBase } = row;
+  switch (col) {
+    case "ticker":
+      return h.ticker;
+    case "portfolio":
+      return h.portfolio_id ? allPortfolios.find((p) => p.id === h.portfolio_id)?.name || "" : "";
+    case "type":
+      return h.asset_type;
+    case "qty":
+      return Number(h.quantity);
+    case "buyPrice":
+      return Number(h.buy_price);
+    case "price":
+      return priceInBase;
+    case "value":
+    case "weight":
+      return currentValue;
+    case "day":
+      return dayChangePct;
+    case "gain":
+      return gainPct;
+    default:
+      return null;
+  }
+}
+
+function renderHoldingsTable() {
+  const tbody = document.getElementById("holdingsBody");
+  const totalValue = lastHoldingsTotalValue;
+
+  let rows = lastHoldingsRows;
+  if (holdingsSearchTerm) {
+    const term = holdingsSearchTerm.toLowerCase();
+    rows = rows.filter(({ h }) => h.ticker.toLowerCase().includes(term));
+  }
+
   if (rows.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="11">No holdings in this portfolio — add one below or switch to "All portfolios".</td></tr>`;
+    tbody.innerHTML =
+      lastHoldingsRows.length === 0
+        ? `<tr><td colspan="11">No holdings in this portfolio — add one below or switch to "All portfolios".</td></tr>`
+        : `<tr><td colspan="11">No holdings match "${escapeHtml(holdingsSearchTerm)}".</td></tr>`;
+    updateSortIndicators();
     return;
+  }
+
+  if (holdingsSortColumn) {
+    rows = [...rows].sort((a, b) => {
+      const av = holdingsSortValue(a, holdingsSortColumn);
+      const bv = holdingsSortValue(b, holdingsSortColumn);
+      if (av == null && bv == null) return 0;
+      if (av == null) return 1; // nulls/missing data always sort last
+      if (bv == null) return -1;
+      const cmp = typeof av === "string" ? av.localeCompare(bv) : av - bv;
+      return cmp * holdingsSortDirection;
+    });
   }
 
   const portfolioNameById = Object.fromEntries(allPortfolios.map((p) => [p.id, p.name]));
@@ -221,7 +350,14 @@ async function loadHoldings() {
 
   tbody.querySelectorAll(".del-btn").forEach((btn) =>
     btn.addEventListener("click", async () => {
-      if (!confirm("Delete this holding? This does NOT record a sale — use \"Sell\" instead if you actually disposed of it.")) return;
+      const ok = await showModal({
+        type: "confirm",
+        title: "Delete holding?",
+        message: 'This does NOT record a sale — use "Sell" instead if you actually disposed of it.',
+        danger: true,
+        confirmLabel: "Delete",
+      });
+      if (!ok) return;
       await sb.from("holdings").delete().eq("id", btn.dataset.id);
       loadHoldings();
     })
@@ -234,7 +370,40 @@ async function loadHoldings() {
   tbody.querySelectorAll(".sell-btn").forEach((btn) =>
     btn.addEventListener("click", () => startSell(window.__holdingsById[btn.dataset.id]))
   );
+
+  updateSortIndicators();
 }
+
+function updateSortIndicators() {
+  document.querySelectorAll("#holdingsTable th[data-sort]").forEach((th) => {
+    th.classList.toggle("sorted", th.dataset.sort === holdingsSortColumn);
+    const existingArrow = th.querySelector(".sort-arrow");
+    if (existingArrow) existingArrow.remove();
+    if (th.dataset.sort === holdingsSortColumn) {
+      const arrow = document.createElement("span");
+      arrow.className = "sort-arrow";
+      arrow.textContent = holdingsSortDirection === 1 ? "▲" : "▼";
+      th.appendChild(arrow);
+    }
+  });
+}
+
+document.querySelectorAll("#holdingsTable th[data-sort]").forEach((th) => {
+  th.addEventListener("click", () => {
+    const col = th.dataset.sort;
+    if (holdingsSortColumn === col) holdingsSortDirection *= -1;
+    else {
+      holdingsSortColumn = col;
+      holdingsSortDirection = 1;
+    }
+    renderHoldingsTable();
+  });
+});
+
+document.getElementById("holdingsSearch").addEventListener("input", (e) => {
+  holdingsSearchTerm = e.target.value.trim();
+  renderHoldingsTable();
+});
 
 function renderAllocation(rows, totalValue) {
   const byType = {};
@@ -301,6 +470,12 @@ function resetSummary() {
 // whole-account series (portfolio_value_history); a specific portfolio reads
 // its own series (portfolio_history, scoped by portfolio_id). Both tables are
 // kept live by loadHoldings() above and by the Worker's daily job/backfill.
+// The full (unfiltered) history for whatever's currently selected — kept
+// around so the 1M/3M/1Y/All range buttons can just re-slice this in memory
+// instead of re-querying every time you click one.
+let fullHistoryData = [];
+let chartRange = "all";
+
 async function loadValueHistory() {
   const svg = document.getElementById("valueChart");
   const caption = document.getElementById("chartCaption");
@@ -319,6 +494,7 @@ async function loadValueHistory() {
   if (error) {
     svg.innerHTML = "";
     caption.textContent = `Could not load history: ${error.message}`;
+    fullHistoryData = [];
     return;
   }
   if (!data || data.length === 0) {
@@ -326,7 +502,31 @@ async function loadValueHistory() {
     caption.textContent = viewingAll
       ? "No history yet — visit <WORKER_URL>/backfill-history once to seed it from real historical prices, or check back after a few scheduled runs."
       : "No history yet for this portfolio — it'll appear after your next edit/poll (live) or the next /backfill-history run (real historical prices).";
+    fullHistoryData = [];
     return;
+  }
+
+  fullHistoryData = data;
+  applyChartRange();
+}
+
+// Slices fullHistoryData down to the selected range (Day 17) and (re)draws.
+// Falls back to showing everything if the selected range would leave fewer
+// than 2 points to plot — a 1-point "line" isn't useful, and it's better to
+// show the fuller picture than an empty chart.
+function applyChartRange() {
+  const svg = document.getElementById("valueChart");
+  const caption = document.getElementById("chartCaption");
+  if (!fullHistoryData.length) return;
+
+  let data = fullHistoryData;
+  if (chartRange !== "all") {
+    const days = { "1M": 30, "3M": 90, "1Y": 365 }[chartRange];
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - days);
+    const cutoffStr = cutoff.toISOString().slice(0, 10);
+    const filtered = fullHistoryData.filter((p) => p.date >= cutoffStr);
+    if (filtered.length >= 2) data = filtered;
   }
 
   renderValueChart(svg, data);
@@ -334,6 +534,14 @@ async function loadValueHistory() {
   const last = data[data.length - 1];
   caption.textContent = `${new Date(first.date).toLocaleDateString()} – ${new Date(last.date).toLocaleDateString()} · ${data.length} day${data.length === 1 ? "" : "s"} of history`;
 }
+
+document.querySelectorAll("#chartRangeButtons button").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    chartRange = btn.dataset.range;
+    document.querySelectorAll("#chartRangeButtons button").forEach((b) => b.classList.toggle("active", b === btn));
+    applyChartRange();
+  });
+});
 
 // Cap how many points get plotted — a long backfill can produce hundreds of
 // daily rows, and plotting every single one makes the line look noisy/jagged
@@ -424,7 +632,61 @@ function renderValueChart(svg, rawPoints) {
     <text x="${padX}" y="16" fill="#9aa0ac" font-size="11">${maxLabel}</text>
     <rect x="${(padX - 4).toFixed(1)}" y="${height - 22}" width="${minLabelWidth.toFixed(1)}" height="16" fill="#171a21" fill-opacity="0.9" rx="3"></rect>
     <text x="${padX}" y="${height - 8}" fill="#9aa0ac" font-size="11">${minLabel}</text>
+    <line id="chartHoverLine" x1="0" y1="${padY}" x2="0" y2="${height - padY}" stroke="#9aa0ac" stroke-width="1" stroke-dasharray="2,3" style="display: none"></line>
+    <circle id="chartHoverDot" r="4" fill="${stroke}" stroke="#0b0d12" stroke-width="1.5" style="display: none"></circle>
   `;
+
+  // Hover/tap-to-inspect (Day 17): find the nearest plotted point to the
+  // pointer and show its exact date/value — mouse for desktop, touch for
+  // mobile. Coordinates convert from screen pixels into the SVG's own
+  // viewBox units since the rendered box and the viewBox rarely match 1:1.
+  const hoverLine = svg.querySelector("#chartHoverLine");
+  const hoverDot = svg.querySelector("#chartHoverDot");
+  const tooltip = document.getElementById("chartTooltip");
+  if (tooltip) tooltip.style.display = "none"; // clear any stale tooltip left showing from before this (re)render
+
+  function showHoverAt(clientX) {
+    const rect = svg.getBoundingClientRect();
+    const mouseX = ((clientX - rect.left) / rect.width) * width;
+    let nearestIdx = 0;
+    let minDist = Infinity;
+    coords.forEach((c, i) => {
+      const d = Math.abs(c.x - mouseX);
+      if (d < minDist) {
+        minDist = d;
+        nearestIdx = i;
+      }
+    });
+    const c = coords[nearestIdx];
+    const p = points[nearestIdx];
+    hoverLine.setAttribute("x1", c.x.toFixed(1));
+    hoverLine.setAttribute("x2", c.x.toFixed(1));
+    hoverLine.style.display = "";
+    hoverDot.setAttribute("cx", c.x.toFixed(1));
+    hoverDot.setAttribute("cy", c.y.toFixed(1));
+    hoverDot.style.display = "";
+    if (tooltip) {
+      tooltip.style.display = "block";
+      tooltip.style.left = `${(c.x / width) * 100}%`;
+      tooltip.style.top = `${(c.y / height) * 100}%`;
+      tooltip.textContent = `${new Date(p.date).toLocaleDateString()} · ${fmtMoney(p.total_value)}`;
+    }
+  }
+  function hideHover() {
+    hoverLine.style.display = "none";
+    hoverDot.style.display = "none";
+    if (tooltip) tooltip.style.display = "none";
+  }
+
+  svg.onmousemove = (e) => showHoverAt(e.clientX);
+  svg.onmouseleave = hideHover;
+  svg.ontouchmove = (e) => {
+    if (e.touches[0]) {
+      showHoverAt(e.touches[0].clientX);
+      e.preventDefault(); // avoid scrolling the page while inspecting the chart
+    }
+  };
+  svg.ontouchend = hideHover;
 }
 
 // Editing (Section 11 "Could": edit, not just delete) reuses the add-holding
@@ -669,11 +931,16 @@ document.getElementById("portfolioFilterSelect").addEventListener("change", (e) 
 });
 
 document.getElementById("newPortfolioBtn").addEventListener("click", async () => {
-  const name = prompt("Name this portfolio (e.g. Retirement, Trading):");
-  if (!name || !name.trim()) return;
-  const { data, error } = await sb.from("portfolios").insert({ user_id: currentUserId, name: name.trim() }).select().single();
+  const name = await showModal({
+    type: "prompt",
+    title: "New portfolio",
+    message: "Name this portfolio (e.g. Retirement, Trading):",
+    placeholder: "Portfolio name",
+  });
+  if (!name) return;
+  const { data, error } = await sb.from("portfolios").insert({ user_id: currentUserId, name }).select().single();
   if (error) {
-    alert(`Could not create portfolio: ${error.message}`);
+    await showModal({ title: "Could not create portfolio", message: error.message });
     return;
   }
   await loadPortfolios();
@@ -688,11 +955,16 @@ document.getElementById("newPortfolioBtn").addEventListener("click", async () =>
 document.getElementById("renamePortfolioBtn").addEventListener("click", async () => {
   if (selectedPortfolioId === "__all__") return;
   const current = allPortfolios.find((p) => p.id === selectedPortfolioId);
-  const name = prompt("Rename portfolio:", current?.name || "");
-  if (!name || !name.trim()) return;
-  const { error } = await sb.from("portfolios").update({ name: name.trim() }).eq("id", selectedPortfolioId);
+  const name = await showModal({
+    type: "prompt",
+    title: "Rename portfolio",
+    defaultValue: current?.name || "",
+    placeholder: "Portfolio name",
+  });
+  if (!name) return;
+  const { error } = await sb.from("portfolios").update({ name }).eq("id", selectedPortfolioId);
   if (error) {
-    alert(`Could not rename portfolio: ${error.message}`);
+    await showModal({ title: "Could not rename portfolio", message: error.message });
     return;
   }
   await loadPortfolios();
@@ -702,10 +974,17 @@ document.getElementById("renamePortfolioBtn").addEventListener("click", async ()
 document.getElementById("deletePortfolioBtn").addEventListener("click", async () => {
   if (selectedPortfolioId === "__all__") return;
   const current = allPortfolios.find((p) => p.id === selectedPortfolioId);
-  if (!confirm(`Delete portfolio "${current?.name}"? Its holdings are NOT deleted — they just become unassigned and stay visible under "All portfolios". Its chart history IS deleted.`)) return;
+  const ok = await showModal({
+    type: "confirm",
+    title: `Delete "${current?.name}"?`,
+    message: 'Its holdings are NOT deleted — they just become unassigned and stay visible under "All portfolios". Its chart history IS deleted.',
+    danger: true,
+    confirmLabel: "Delete",
+  });
+  if (!ok) return;
   const { error } = await sb.from("portfolios").delete().eq("id", selectedPortfolioId);
   if (error) {
-    alert(`Could not delete portfolio: ${error.message}`);
+    await showModal({ title: "Could not delete portfolio", message: error.message });
     return;
   }
   selectedPortfolioId = "__all__";
