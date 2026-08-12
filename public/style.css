@@ -215,11 +215,23 @@ footer { margin-top: 40px; color: var(--muted); font-size: 0.75rem; border-top: 
 }
 .chart-caption { color: var(--muted); font-size: 0.8rem; margin-top: 6px; }
 
-.recent-runs h2 { display: flex; align-items: center; gap: 12px; }
-.run-now-btn { font-size: 0.8rem; padding: 4px 10px; }
-.run-now-status { color: var(--muted); font-size: 0.8rem; margin: -8px 0 12px; }
-.run-now-status.positive { color: var(--green); }
-.run-now-status.negative { color: var(--red); }
+.quick-actions { display: flex; align-items: center; gap: 10px; margin: 4px 0 24px; flex-wrap: wrap; }
+.quick-actions button { font-size: 0.82rem; padding: 7px 14px; }
+.quick-actions-status { color: var(--muted); font-size: 0.82rem; }
+.quick-actions-status.positive { color: var(--green); }
+.quick-actions-status.negative { color: var(--red); }
+
+.holdings h2, .realized-gains h2 { display: flex; align-items: center; gap: 12px; }
+.export-btn {
+  font-size: 0.78rem;
+  padding: 4px 10px;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-weight: 500;
+  margin-left: auto;
+}
+.export-btn:hover { color: var(--accent); border-color: var(--accent); opacity: 1; }
 
 .ticker-search-wrap { position: relative; }
 .ticker-suggestions {

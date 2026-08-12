@@ -13,7 +13,15 @@ function toBase(amount, currency, fxRates, baseCurrency) {
   return amount / rate;
 }
 
-export function computeHoldingMetrics(holding, priceRow, fxRatesToday, fxRatesYesterday, baseCurrency) {
+// buyFxRate (Day 19): the FX rate in effect on the holding's OWN buy_date,
+// looked up by the caller (see index.js's ensureBuyDateFxCoverage +
+// processUserDailyJob) — NOT fxRatesToday, which is what this used before
+// and is why cost basis used to drift with FX movement since purchase, on
+// top of genuine price movement. Optional: when no historical rate has been
+// cached yet for this holding's currency/date, the caller passes null/
+// undefined and this falls back to fxRatesToday exactly like before — a
+// graceful degrade, not a hard requirement.
+export function computeHoldingMetrics(holding, priceRow, fxRatesToday, fxRatesYesterday, baseCurrency, buyFxRate) {
   const flags = [];
 
   if (!priceRow || priceRow.price == null) {
@@ -33,7 +41,8 @@ export function computeHoldingMetrics(holding, priceRow, fxRatesToday, fxRatesYe
 
   const priceCcy = priceRow.currency;
   const priceInBase = toBase(priceRow.price, priceCcy, fxRatesToday, baseCurrency);
-  const buyPriceInBase = toBase(holding.buy_price, holding.buy_currency, fxRatesToday, baseCurrency);
+  const buyFxRates = buyFxRate != null ? { [holding.buy_currency]: buyFxRate } : fxRatesToday;
+  const buyPriceInBase = toBase(holding.buy_price, holding.buy_currency, buyFxRates, baseCurrency);
 
   if (priceInBase == null || buyPriceInBase == null) flags.push("missing_fx_rate");
   if (priceRow.is_stale) flags.push("stale_price");
@@ -95,9 +104,11 @@ export function computeHoldingMetrics(holding, priceRow, fxRatesToday, fxRatesYe
   };
 }
 
-export function computePortfolioMetrics({ holdings, pricesByTicker, fxRatesToday, fxRatesYesterday, baseCurrency }) {
+// buyFxRatesById (Day 19): optional map of { [holding.id]: rate } for the
+// FX rate on each holding's buy_date — see computeHoldingMetrics above.
+export function computePortfolioMetrics({ holdings, pricesByTicker, fxRatesToday, fxRatesYesterday, baseCurrency, buyFxRatesById }) {
   const rows = holdings.map((h) =>
-    computeHoldingMetrics(h, pricesByTicker[h.ticker], fxRatesToday, fxRatesYesterday, baseCurrency)
+    computeHoldingMetrics(h, pricesByTicker[h.ticker], fxRatesToday, fxRatesYesterday, baseCurrency, buyFxRatesById?.[h.id])
   );
 
   const valid = rows.filter((r) => !r.error && r.currentValue != null);

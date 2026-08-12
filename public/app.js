@@ -106,6 +106,22 @@ function showModal({ type = "alert", title = "", message = "", placeholder = "",
   });
 }
 
+// Attaches the signed-in user's Supabase access token as a Bearer header.
+// The Worker now requires this on every route that costs API quota or
+// touches user data (Day 19: /refresh-prices, /run, /search-symbols,
+// /status used to be wide open to anyone who knew the URL) — see
+// worker/src/index.js's getAuthedUser(). If there's no session for some
+// reason, this still fires a plain unauthenticated request, which the
+// Worker will just reject with 401 rather than silently doing nothing.
+async function authedFetch(url, opts = {}) {
+  const {
+    data: { session },
+  } = await sb.auth.getSession();
+  const headers = { ...(opts.headers || {}) };
+  if (session?.access_token) headers.Authorization = `Bearer ${session.access_token}`;
+  return fetch(url, { ...opts, headers });
+}
+
 async function fetchLatestPrices(tickers) {
   if (tickers.length === 0) return {};
   const { data, error } = await sb
@@ -137,10 +153,51 @@ async function fetchLatestFx(currencies) {
   return rates;
 }
 
-function computeRow(holding, priceRow, fxRates) {
+// Historical FX lookup (Day 19): given a list of {currency, date} pairs,
+// returns a Map of "currency|date" -> FX rate in effect ON OR BEFORE that
+// date (quote->base convention, same as fetchLatestFx). Backed by whatever
+// the Worker has cached in fx_rates (see ensureBuyDateFxCoverage in
+// worker/src/index.js) — one query total, then an in-memory carry-forward
+// scan per pair, same pattern as the Worker's own chart-backfill math.
+// Pairs with no cached history yet (not backfilled) simply have no entry —
+// callers fall back to the "now" rate exactly like before this feature.
+async function fetchHistoricalFxForDates(pairs) {
+  const currencies = [...new Set(pairs.map((p) => p.currency).filter((c) => c && c !== BASE_CURRENCY))];
+  const result = new Map();
+  if (!currencies.length) return result;
+
+  const { data, error } = await sb
+    .from("fx_rates")
+    .select("quote, rate, as_of")
+    .eq("base", BASE_CURRENCY)
+    .in("quote", currencies)
+    .order("as_of", { ascending: true });
+  if (error || !data) return result;
+
+  const byCurrency = {};
+  for (const row of data) (byCurrency[row.quote] ??= []).push(row);
+
+  for (const { currency, date } of pairs) {
+    if (!currency || currency === BASE_CURRENCY || !date) continue;
+    const rows = byCurrency[currency] || [];
+    const cutoff = `${date}T23:59:59.999Z`;
+    let match = null;
+    for (const row of rows) {
+      if (row.as_of > cutoff) break; // rows are sorted ascending — stop at the first one past the cutoff
+      match = row;
+    }
+    if (match) result.set(`${currency}|${date}`, 1 / match.rate); // invert: fx_rates stores base->quote, we need quote->base
+  }
+  return result;
+}
+
+function computeRow(holding, priceRow, fxRates, buyFxOverride) {
   const fx = fxRates[priceRow?.currency] ?? null;
   const priceInBase = priceRow && fx ? priceRow.price * fx : null;
-  const buyFx = fxRates[holding.buy_currency] ?? null;
+  // buyFxOverride, when present, is the ACTUAL rate on this holding's
+  // buy_date (see fetchHistoricalFxForDates) — falls back to "now" when no
+  // historical rate has been cached for that currency/date yet.
+  const buyFx = buyFxOverride ?? fxRates[holding.buy_currency] ?? null;
   const costBasis = buyFx ? holding.quantity * holding.buy_price * buyFx : null;
   const currentValue = priceInBase != null ? holding.quantity * priceInBase : null;
   const gainAbs = currentValue != null && costBasis != null ? currentValue - costBasis : null;
@@ -176,9 +233,10 @@ async function loadHoldings() {
 
   const tickers = [...new Set(holdings.map((h) => h.ticker))];
   const currencies = [...new Set(holdings.flatMap((h) => [h.buy_currency]))];
-  const [prices, fxRates] = await Promise.all([
+  const [prices, fxRates, buyFxByHolding] = await Promise.all([
     fetchLatestPrices(tickers).catch(() => ({})),
     fetchLatestFx(currencies).catch(() => ({ [BASE_CURRENCY]: 1 })),
+    fetchHistoricalFxForDates(holdings.map((h) => ({ currency: h.buy_currency, date: h.buy_date }))).catch(() => new Map()),
   ]);
   // also need FX for whatever currency prices come back in
   const priceCurrencies = Object.values(prices).map((p) => p.currency);
@@ -187,7 +245,10 @@ async function loadHoldings() {
 
   // Computed over EVERY holding regardless of the portfolio filter — the
   // whole-account total feeds the "All portfolios" chart view below.
-  const allRows = holdings.map((h) => ({ h, ...computeRow(h, prices[h.ticker], fxRates) }));
+  const allRows = holdings.map((h) => ({
+    h,
+    ...computeRow(h, prices[h.ticker], fxRates, buyFxByHolding.get(`${h.buy_currency}|${h.buy_date}`)),
+  }));
   const wholeAccountValue = allRows.reduce((s, r) => s + (r.currentValue || 0), 0);
 
   // Per-portfolio totals — feeds each portfolio's own chart view. Holdings
@@ -438,40 +499,6 @@ function renderAllocation(rows, totalValue) {
   };
   renderList(document.getElementById("allocByType"), byType);
   renderList(document.getElementById("allocByCurrency"), byCurrency);
-}
-
-// Day 13: "a visible log of recent runs (status, duration, errors)." The
-// Worker's /status endpoint already returns this; this just gives it a face
-// on the dashboard, scoped to the signed-in user's own runs via RLS.
-async function loadRecentRuns() {
-  const tbody = document.getElementById("recentRunsBody");
-  const { data, error } = await sb
-    .from("daily_reports")
-    .select("report_date, status, duration_ms, total_value, error")
-    .order("report_date", { ascending: false })
-    .limit(10);
-
-  if (error) {
-    tbody.innerHTML = `<tr><td colspan="5">Could not load run history: ${error.message}</td></tr>`;
-    return;
-  }
-  if (!data || data.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="5">No runs yet — the scheduled Worker hasn't run for this account.</td></tr>`;
-    return;
-  }
-
-  tbody.innerHTML = data
-    .map(
-      (r) => `
-    <tr>
-      <td>${new Date(r.report_date).toLocaleDateString()}</td>
-      <td class="${r.status === "sent" ? "positive" : r.status === "failed" ? "negative" : ""}">${r.status}</td>
-      <td>${r.duration_ms != null ? `${(r.duration_ms / 1000).toFixed(1)}s` : "—"}</td>
-      <td>${fmtMoney(r.total_value)}</td>
-      <td>${r.error ? `<span class="negative">${r.error}</span>` : "—"}</td>
-    </tr>`
-    )
-    .join("");
 }
 
 function resetSummary() {
@@ -793,12 +820,19 @@ document.getElementById("sellForm").addEventListener("submit", async (e) => {
   if (sellQuantity > sellingHolding.quantity) return (errEl.textContent = `Can't sell more than the ${sellingHolding.quantity} you hold.`);
   if (!(sellPrice > 0)) return (errEl.textContent = "Sell price must be positive.");
 
-  // Known limitation (documented in schema.sql/README): the buy side is
-  // converted at whatever FX rate is cached right now, not the rate on
-  // buy_date — same simplification the live unrealised-gain figures use.
-  const fxRates = await fetchLatestFx([sellingHolding.buy_currency, sellCurrency]).catch(() => ({ [BASE_CURRENCY]: 1 }));
-  const buyFx = fxRates[sellingHolding.buy_currency] ?? null;
-  const sellFx = fxRates[sellCurrency] ?? null;
+  // Day 19: the buy side now converts at the ACTUAL rate on buy_date (and
+  // the sell side at the actual rate on sell_date), not just whatever's
+  // cached "now" — falls back to the current rate for either side if no
+  // historical rate has been cached yet for that currency/date.
+  const [fxRates, histFx] = await Promise.all([
+    fetchLatestFx([sellingHolding.buy_currency, sellCurrency]).catch(() => ({ [BASE_CURRENCY]: 1 })),
+    fetchHistoricalFxForDates([
+      { currency: sellingHolding.buy_currency, date: sellingHolding.buy_date },
+      { currency: sellCurrency, date: sellDate },
+    ]).catch(() => new Map()),
+  ]);
+  const buyFx = histFx.get(`${sellingHolding.buy_currency}|${sellingHolding.buy_date}`) ?? fxRates[sellingHolding.buy_currency] ?? null;
+  const sellFx = histFx.get(`${sellCurrency}|${sellDate}`) ?? fxRates[sellCurrency] ?? null;
 
   // fxRates[currency] is "1 unit of that currency, expressed in base
   // currency" (see fetchLatestFx above) — so converting TO base means
@@ -849,6 +883,10 @@ document.getElementById("sellForm").addEventListener("submit", async (e) => {
 
 // Day 11-style "Could" addition: a record of every closed position, not just
 // what you currently hold.
+// Kept around so the CSV export button can reuse whatever's already loaded
+// instead of firing a second query.
+let lastRealizedGainsRows = [];
+
 async function loadRealizedGains() {
   const tbody = document.getElementById("realizedGainsBody");
   const { data, error } = await sb
@@ -863,6 +901,7 @@ async function loadRealizedGains() {
     totalEl.textContent = "—";
     return;
   }
+  lastRealizedGainsRows = data || [];
   if (!data || data.length === 0) {
     tbody.innerHTML = `<tr><td colspan="6">No closed positions yet — use "Sell" on a holding to record one.</td></tr>`;
     totalEl.textContent = fmtMoney(0);
@@ -891,6 +930,70 @@ async function loadRealizedGains() {
     )
     .join("");
 }
+
+// --- CSV export --------------------------------------------------------
+// Everything's client-side: the data's already in memory from the last
+// load, so this just formats it and triggers a browser download — no Worker
+// round trip needed.
+function toCsv(rows, columns) {
+  const escapeCsv = (v) => {
+    if (v == null) return "";
+    const s = String(v);
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const header = columns.map((c) => escapeCsv(c.label)).join(",");
+  const body = rows.map((r) => columns.map((c) => escapeCsv(c.value(r))).join(",")).join("\n");
+  return `${header}\n${body}`;
+}
+
+function downloadCsv(filename, csvText) {
+  const blob = new Blob([csvText], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+document.getElementById("exportHoldingsBtn").addEventListener("click", () => {
+  // Exports whatever's currently loaded, respecting the active portfolio
+  // filter — "All portfolios" exports everything, a specific portfolio
+  // exports just that one.
+  if (!lastHoldingsRows.length) return;
+  const columns = [
+    { label: "Ticker", value: (r) => r.h.ticker },
+    { label: "Portfolio", value: (r) => (r.h.portfolio_id ? allPortfolios.find((p) => p.id === r.h.portfolio_id)?.name || "" : "") },
+    { label: "Type", value: (r) => r.h.asset_type },
+    { label: "Quantity", value: (r) => r.h.quantity },
+    { label: "Buy price", value: (r) => r.h.buy_price },
+    { label: "Buy currency", value: (r) => r.h.buy_currency },
+    { label: "Buy date", value: (r) => r.h.buy_date },
+    { label: `Current price (${BASE_CURRENCY})`, value: (r) => r.priceInBase ?? "" },
+    { label: `Value (${BASE_CURRENCY})`, value: (r) => r.currentValue ?? "" },
+    { label: "Gain/loss %", value: (r) => r.gainPct ?? "" },
+  ];
+  downloadCsv(`holdings_${new Date().toISOString().slice(0, 10)}.csv`, toCsv(lastHoldingsRows, columns));
+});
+
+document.getElementById("exportRealizedGainsBtn").addEventListener("click", () => {
+  if (!lastRealizedGainsRows.length) return;
+  const columns = [
+    { label: "Ticker", value: (r) => r.ticker },
+    { label: "Quantity", value: (r) => r.quantity },
+    { label: "Buy price", value: (r) => r.buy_price },
+    { label: "Buy currency", value: (r) => r.buy_currency },
+    { label: "Buy date", value: (r) => r.buy_date },
+    { label: "Sell price", value: (r) => r.sell_price },
+    { label: "Sell currency", value: (r) => r.sell_currency },
+    { label: "Sell date", value: (r) => r.sell_date },
+    { label: `Realized gain (${BASE_CURRENCY})`, value: (r) => r.realized_gain_abs ?? "" },
+    { label: "Realized gain %", value: (r) => r.realized_gain_pct ?? "" },
+  ];
+  downloadCsv(`realized_gains_${new Date().toISOString().slice(0, 10)}.csv`, toCsv(lastRealizedGainsRows, columns));
+});
 
 // --- Portfolios: an optional grouping layer on top of holdings ------------
 // Scope decision (see README/schema.sql): portfolios filter the holdings
@@ -1077,7 +1180,7 @@ tickerInputEl.addEventListener("input", () => {
   }
   tickerSearchDebounce = setTimeout(async () => {
     try {
-      const res = await fetch(`${window.WORKER_URL}/search-symbols?q=${encodeURIComponent(q)}`);
+      const res = await authedFetch(`${window.WORKER_URL}/search-symbols?q=${encodeURIComponent(q)}`);
       const json = await res.json();
       renderTickerSuggestions(json.data || []);
     } catch (err) {
@@ -1115,40 +1218,80 @@ tickerInputEl.addEventListener("blur", () => {
 // --- Manual "Run now" button ------------------------------------------------
 // Wires the Worker's /run?user_id= endpoint (scoped to just this user — see
 // worker/src/index.js runDailyJobForUser) to a button instead of requiring
-// curl. Sends a real email and writes a real Recent Runs row, same as a
-// scheduled run would for this account.
+// curl. Sends a real email and writes a daily_reports row (Worker-side audit
+// trail; no longer surfaced in the UI — see removed "Recent Runs" section),
+// same as a scheduled run would for this account.
 document.getElementById("runNowBtn").addEventListener("click", async () => {
   const btn = document.getElementById("runNowBtn");
-  const statusEl = document.getElementById("runNowStatus");
+  const statusEl = document.getElementById("quickActionsStatus");
   if (!currentUserId || !window.WORKER_URL) return;
 
   btn.disabled = true;
   btn.textContent = "Running…";
-  statusEl.className = "run-now-status";
+  statusEl.className = "quick-actions-status";
   statusEl.textContent = "Refreshing prices and sending your daily email now — this can take a few seconds…";
 
   try {
-    const res = await fetch(`${window.WORKER_URL}/run?user_id=${encodeURIComponent(currentUserId)}`);
+    const res = await authedFetch(`${window.WORKER_URL}/run?user_id=${encodeURIComponent(currentUserId)}`);
     const result = await res.json();
-    if (result.status === "completed" && result.user?.status !== "failed") {
-      statusEl.className = "run-now-status positive";
+    if (!res.ok) {
+      statusEl.className = "quick-actions-status negative";
+      statusEl.textContent = `Failed: ${result.error || `HTTP ${res.status}`}`;
+    } else if (result.status === "completed" && result.user?.status !== "failed") {
+      statusEl.className = "quick-actions-status positive";
       statusEl.textContent = `Done — email sent (${result.user?.status || "sent"}), took ${(result.duration_ms / 1000).toFixed(1)}s.`;
     } else if (result.status === "skipped") {
-      statusEl.className = "run-now-status";
+      statusEl.className = "quick-actions-status";
       statusEl.textContent = `Skipped: ${result.reason}`;
     } else {
-      statusEl.className = "run-now-status negative";
+      statusEl.className = "quick-actions-status negative";
       statusEl.textContent = `Failed: ${result.error || result.user?.error || "unknown error"}`;
     }
   } catch (err) {
-    statusEl.className = "run-now-status negative";
+    statusEl.className = "quick-actions-status negative";
     statusEl.textContent = `Could not reach the Worker: ${err.message}`;
   } finally {
     btn.disabled = false;
     btn.textContent = "Run now";
     loadHoldings();
     loadValueHistory();
-    loadRecentRuns();
+  }
+});
+
+// "Fetch prices" — same underlying /refresh-prices endpoint the app already
+// calls automatically after every add/edit, just exposed as a visible,
+// on-demand button with feedback: refreshes the shared price/FX cache with
+// NO email side effect (unlike "Run now", which sends your daily email).
+document.getElementById("fetchPricesBtn").addEventListener("click", async () => {
+  const btn = document.getElementById("fetchPricesBtn");
+  const statusEl = document.getElementById("quickActionsStatus");
+  if (!window.WORKER_URL) return;
+
+  btn.disabled = true;
+  btn.textContent = "Fetching…";
+  statusEl.className = "quick-actions-status";
+  statusEl.textContent = "Refreshing prices — no email sent…";
+
+  try {
+    const result = await triggerPriceRefresh({ silent: false });
+    if (result?.skipped) {
+      statusEl.className = "quick-actions-status";
+      statusEl.textContent = `Skipped: ${result.reason}`;
+    } else if (result?.error) {
+      statusEl.className = "quick-actions-status negative";
+      statusEl.textContent = `Failed: ${result.error}`;
+    } else {
+      statusEl.className = "quick-actions-status positive";
+      statusEl.textContent = "Prices refreshed.";
+    }
+  } catch (err) {
+    statusEl.className = "quick-actions-status negative";
+    statusEl.textContent = `Could not reach the Worker: ${err.message}`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Fetch prices";
+    loadHoldings();
+    loadValueHistory();
   }
 });
 
@@ -1281,30 +1424,37 @@ document.getElementById("holdingForm").addEventListener("submit", async (e) => {
 
 // Default the buy-date field to today so adding a holding usually needs zero
 // typing in that field — click the calendar icon only if you bought it on a
-// different day. The "Today" button resets it back if you've changed it.
+// different day.
 function setDateToToday() {
   const input = document.getElementById("buyDateInput");
   if (input) input.value = new Date().toISOString().slice(0, 10);
 }
-document.getElementById("todayBtn").addEventListener("click", setDateToToday);
 
 // Ask the Worker to fetch+cache a price for anything missing (like a
 // just-added holding) without waiting for tomorrow's scheduled run. This is
 // a cache-only refresh — no email gets sent — and the Worker throttles it
 // server-side so repeated clicks don't burn through the market-data rate limit.
-async function triggerPriceRefresh() {
-  if (!window.WORKER_URL) return;
+// `silent: true` (the default, used automatically after add/edit) swallows
+// errors and just logs them; the "Fetch prices" button passes `silent: false`
+// so it can show the failure to you directly instead of failing invisibly.
+async function triggerPriceRefresh({ silent = true } = {}) {
+  if (!window.WORKER_URL) return null;
   try {
-    const res = await fetch(`${window.WORKER_URL}/refresh-prices`);
+    const res = await authedFetch(`${window.WORKER_URL}/refresh-prices`);
     if (!res.ok) {
-      console.warn(`Price refresh request failed: HTTP ${res.status} (check WORKER_URL in config.js is correct)`);
-      return;
+      const msg = `Price refresh request failed: HTTP ${res.status}`;
+      if (!silent) throw new Error(msg);
+      console.warn(`${msg} (check WORKER_URL in config.js is correct)`);
+      return null;
     }
     const result = await res.json();
     if (result.skipped) console.log("Price refresh skipped:", result.reason);
     if (result.error) console.warn("Price refresh failed:", result.error);
+    return result;
   } catch (err) {
+    if (!silent) throw err;
     console.warn("Could not reach the Worker to refresh prices:", err.message);
+    return null;
   }
 }
 
@@ -1324,7 +1474,6 @@ function showApp(user) {
   setDateToToday();
   loadPortfolios().then(loadHoldings);
   loadValueHistory();
-  loadRecentRuns();
   loadRealizedGains();
   if (!window.__pollingStarted) {
     window.__pollingStarted = true;
@@ -1332,7 +1481,6 @@ function showApp(user) {
       loadPortfolios();
       loadHoldings();
       loadValueHistory();
-      loadRecentRuns();
       loadRealizedGains();
     }, 5 * 60 * 1000); // refresh the view every 5 min from cache (not the API)
   }

@@ -41,7 +41,7 @@ more code.
 
 **Built and working:**
 - All Section 11 **Must** items: holdings CRUD, cached prices with an "as of" timestamp, base-currency conversion, hand-verified value/gain/day-change, scheduled email, news, graceful degradation, no secrets in git.
-- Most **Should** items: retries/backoff, a failure alert on shared-stage errors, price return separated from FX return, a visible recent-runs log (now in the dashboard UI, not just the `/status` API).
+- Most **Should** items: retries/backoff, a failure alert on shared-stage errors, price return separated from FX return, a run history log (`daily_reports` table + the `/status` API — dropped from the dashboard UI itself as of Day 19 to declutter it, but every run is still recorded).
 - Most **Could** items: value-over-time chart (from *real* historical closing prices, not synthetic data), allocation breakdown, edit-holding (not just delete), a mobile-readable email layout.
 - Beyond the brief: full login + multi-user support (see scope note above), an on-demand price refresh after adding a holding, NAV/fund holdings get a longer staleness grace period than intraday stocks and are labelled "NAV" rather than "price."
 
@@ -176,6 +176,14 @@ wrangler secret put TWELVE_DATA_API_KEY
 wrangler secret put MARKETAUX_API_KEY
 wrangler secret put ANTHROPIC_API_KEY
 wrangler secret put RESEND_API_KEY
+
+# Day 19: a shared secret for the two app-wide (not per-user) endpoints —
+# the full multi-user /run and /backfill-history. Pick any long random
+# string; you'll pass it back as ?admin_key=<this value> when you need to
+# hit either of those two routes yourself. Every other endpoint now checks
+# your Supabase session instead — this key is NOT needed for normal use of
+# the site, only for those two specific manual/admin actions.
+wrangler secret put WORKER_ADMIN_KEY
 ```
 Edit `wrangler.toml` `[vars]`: set `EMAIL_FROM` (a Resend-verified sender),
 `EMAIL_TO` (your inbox), `BASE_CURRENCY`, and adjust the cron line to your
@@ -191,16 +199,34 @@ Then deploy:
 ```
 npm run deploy
 ```
-Trigger a real run any time (useful for testing) by visiting
-`https://<your-worker>.workers.dev/run`, and check recent run history at
-`/status`. There's also a **"Run now" button on the dashboard itself**
-(next to "Recent Runs") that hits `/run?user_id=<you>` — scoped to just your
-own holdings/email, unlike a bare `/run` which loops every signed-up user.
+There's a **"Run now" button on the dashboard itself** (top of the page,
+next to "Fetch prices") that hits `/run?user_id=<you>` — scoped to just your
+own holdings/email. As of Day 19 this (and every other endpoint below except
+`/search-symbols`, which just needs any signed-in session) checks that your
+browser's Supabase session actually belongs to the user_id you're asking
+for, so hitting these with `curl` yourself now requires a real access token:
 
-Other endpoints added since the multi-user rewrite: `/search-symbols?q=...`
-(proxies Twelve Data's ticker search for the dashboard's autocomplete — keeps
-the API key server-side) and the existing `/refresh-prices` /
-`/backfill-history` pair.
+```
+# Get your own token from the browser console while signed in to the dashboard:
+#   (await supabase.auth.getSession()).data.session.access_token
+curl -H "Authorization: Bearer <your access token>" \
+  "https://<your-worker>.workers.dev/run?user_id=<your user id>"
+```
+
+The full multi-user `/run` (no `user_id`) and `/backfill-history` are
+app-wide, not any one user's call to make — they're gated behind the
+`WORKER_ADMIN_KEY` secret instead:
+```
+curl "https://<your-worker>.workers.dev/backfill-history?admin_key=<WORKER_ADMIN_KEY>"
+```
+Note the actual daily cron trigger doesn't go through this HTTP route at all
+(see `scheduled()` in `worker/src/index.js`), so none of this affects the
+real scheduled email.
+
+Also there's a **"Fetch prices" button** next to "Run now" — same
+`/refresh-prices` cache refresh the app already triggers automatically after
+every add/edit, just exposed as an on-demand button with visible feedback
+and, importantly, no email side effect.
 
 ### 5. Verify the maths (Day 4 — do not skip this)
 
@@ -238,11 +264,12 @@ for more frequent news refreshes.
 
 ## Known limitations (honest list)
 
-- Single user, no auth — RLS policies are wide open by design (Section 2: "internal demo, keep it simple"). Do not point this at anything beyond test data.
-- FX conversion for cost basis uses the *current* FX rate, not the rate on the buy date — a holding's unrealised gain/loss will include FX drift since purchase that isn't broken out separately. A future version would store the buy-date FX rate at entry time.
+- Multi-user with Supabase Auth + RLS (see "Login gate" note near the top) — every user's holdings/reports/history are scoped to `auth.uid() = user_id`, and as of Day 19 the Worker's HTTP endpoints check a real session token too, not just the database layer. Still an internal/small-scale tool, not hardened for public signup at scale.
+- FX conversion for cost basis: **fixed as of Day 19**, with a caveat. Unrealised gain, realized gain, and the daily email's gain figures now use the actual historical FX rate on each holding's buy_date/sell_date (see `ensureBuyDateFxCoverage` in `worker/src/index.js`), not just today's rate. The caveat: this depends on that historical rate having been backfilled/cached already — a currency/date combination that's never been seen before still falls back to today's rate until the next price refresh or daily run catches it up (usually within minutes of adding the holding, via `/refresh-prices`).
 - No retry/backoff tuning has been load-tested against real rate limits yet — the numbers in `retry.js` (3 attempts, exponential backoff) are reasonable defaults, not measured ones.
 - Metrics logic is duplicated between `public/app.js` (for the live dashboard) and `worker/src/lib/metrics.js` (for the email) rather than shared — acceptable for this scope, but a real product would extract one shared module.
 - No automated tests yet. Given the brief's emphasis on correctness, adding a small test file for `metrics.js` covering the hand-verified examples from Day 4 would be a good next step.
+- `fx_rates` is append-only with no unique constraint (by design — see schema.sql), so re-running `/backfill-history` re-appends the same historical rows each time rather than upserting. Harmless for correctness (lookups always take the closest match) but the table grows on every re-run.
 
 ## Disclaimer (required, Section 10)
 

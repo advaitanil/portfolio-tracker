@@ -20,9 +20,17 @@ import { writeCommentary } from "./lib/commentary.js";
 import { renderEmail, buildSubject, sendEmail } from "./lib/email.js";
 import { fetchHistoricalPrices, fetchHistoricalFxRange, computeHistoryValues } from "./lib/history.js";
 
-// CORS: the front end (a different origin, *.pages.dev) calls /refresh-prices
-// directly from the browser.
-const CORS_HEADERS = { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, OPTIONS" };
+// CORS: the front end (a different origin, *.pages.dev) calls these routes
+// directly from the browser. Day 19: now that authedFetch() sends a custom
+// "Authorization" header, the browser preflights every request with an
+// OPTIONS call first — Access-Control-Allow-Headers has to explicitly
+// include Authorization or the browser blocks the real request before it's
+// ever sent, no matter what the Worker itself would have returned.
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, OPTIONS",
+  "Access-Control-Allow-Headers": "Authorization, Content-Type",
+};
 
 // Don't let rapid front-end calls (e.g. mis-clicks, multiple tabs) burn
 // through Twelve Data's rate limit — skip refetching if we refreshed the
@@ -37,35 +45,72 @@ export default {
   // Lets you trigger the same job manually (Day 6 testing, Day 13 "break
   // things on purpose"), and exposes a tiny JSON status page for the last
   // few runs (Day 13's "visible log of recent runs").
+  //
+  // Day 19 — locked down: every route below used to be reachable by anyone
+  // who knew (or guessed) the URL, with no check that the caller was who
+  // they claimed to be. That's a real cost/privacy risk, not just a
+  // theoretical one: /run with no user_id emails EVERY signed-up user,
+  // /refresh-prices and /backfill-history both burn through Twelve Data's
+  // shared free-tier quota, and /status leaks another user's total_value
+  // and commentary to anyone who can guess their UUID. Now:
+  //   - /run?user_id=X and /status?user_id=X require a valid Supabase
+  //     session AND that the session's user.id matches X.
+  //   - /refresh-prices and /search-symbols require any valid signed-in
+  //     session (not scoped to a specific user — they touch shared,
+  //     not personal, data) so a random bot off the internet can't hit them.
+  //   - /run with NO user_id (the full multi-user job) and /backfill-history
+  //     are both expensive/sensitive at the WHOLE-APP level, not one user's
+  //     problem to authorize — those require a shared admin secret instead
+  //     (?admin_key=..., set via `wrangler secret put WORKER_ADMIN_KEY`).
+  //     The actual daily cron trigger doesn't go through this HTTP route at
+  //     all (see the scheduled() handler above), so this doesn't affect it.
   async fetch(req, env) {
     const url = new URL(req.url);
     if (req.method === "OPTIONS") return new Response(null, { headers: CORS_HEADERS });
 
     if (url.pathname === "/run") {
-      // Optional ?user_id= scopes the run to just one person (Day 15's
-      // "Run now" dashboard button) instead of the full cron job, which
-      // loops every signed-up user and emails each of them. CORS'd since the
-      // front end calls this directly from the browser.
       const userId = url.searchParams.get("user_id");
-      const result = userId ? await runDailyJobForUser(env, userId) : await runDailyJob(env);
+      if (userId) {
+        const authedUser = await getAuthedUser(req, env);
+        if (!authedUser || authedUser.id !== userId) {
+          return Response.json({ error: "unauthorized" }, { status: 401, headers: CORS_HEADERS });
+        }
+        const result = await runDailyJobForUser(env, userId);
+        return Response.json(result, { headers: CORS_HEADERS });
+      }
+      if (!checkAdminKey(url, env)) {
+        return Response.json({ error: "unauthorized — pass ?admin_key=<WORKER_ADMIN_KEY>" }, { status: 401, headers: CORS_HEADERS });
+      }
+      const result = await runDailyJob(env);
       return Response.json(result, { headers: CORS_HEADERS });
     }
     if (url.pathname === "/status") {
       const userId = url.searchParams.get("user_id");
-      if (!userId) return Response.json({ error: "pass ?user_id=<your supabase auth user id>" }, { status: 400 });
+      if (!userId) return Response.json({ error: "pass ?user_id=<your supabase auth user id>" }, { status: 400, headers: CORS_HEADERS });
+      const authedUser = await getAuthedUser(req, env);
+      if (!authedUser || authedUser.id !== userId) {
+        return Response.json({ error: "unauthorized" }, { status: 401, headers: CORS_HEADERS });
+      }
       const sb = makeSupabase(env);
       const reports = await sb.getRecentReports(10, userId).catch((e) => ({ error: e.message }));
-      return Response.json(reports);
+      return Response.json(reports, { headers: CORS_HEADERS });
     }
     if (url.pathname === "/refresh-prices") {
+      const authedUser = await getAuthedUser(req, env);
+      if (!authedUser) return Response.json({ error: "unauthorized" }, { status: 401, headers: CORS_HEADERS });
       const result = await refreshPricesOnly(env);
       return Response.json(result, { headers: CORS_HEADERS });
     }
     if (url.pathname === "/backfill-history") {
+      if (!checkAdminKey(url, env)) {
+        return Response.json({ error: "unauthorized — pass ?admin_key=<WORKER_ADMIN_KEY>" }, { status: 401, headers: CORS_HEADERS });
+      }
       const result = await backfillHistory(env);
       return Response.json(result, { headers: CORS_HEADERS });
     }
     if (url.pathname === "/search-symbols") {
+      const authedUser = await getAuthedUser(req, env);
+      if (!authedUser) return Response.json({ error: "unauthorized" }, { status: 401, headers: CORS_HEADERS });
       const q = url.searchParams.get("q") || "";
       const result = await searchSymbols(q, env);
       return Response.json(result, { headers: CORS_HEADERS });
@@ -76,6 +121,35 @@ export default {
     );
   },
 };
+
+// Verifies a Supabase access token by asking Supabase itself who it belongs
+// to (GET /auth/v1/user) — no JWT/JWKS handling needed in the Worker. Reads
+// the token from "Authorization: Bearer <token>", which the front end sends
+// via app.js's authedFetch(). Returns the Supabase user object (with .id) if
+// valid, or null if missing/expired/invalid.
+async function getAuthedUser(req, env) {
+  const authHeader = req.headers.get("Authorization");
+  if (!authHeader) return null;
+  const token = authHeader.replace(/^Bearer\s+/i, "").trim();
+  if (!token) return null;
+  try {
+    const res = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
+      headers: { Authorization: `Bearer ${token}`, apikey: env.SUPABASE_SERVICE_ROLE_KEY },
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+// Shared secret for the app-wide (not per-user) endpoints — set via
+// `wrangler secret put WORKER_ADMIN_KEY`. If it's never set, these routes
+// stay permanently locked rather than failing open.
+function checkAdminKey(url, env) {
+  const key = url.searchParams.get("admin_key");
+  return !!env.WORKER_ADMIN_KEY && key === env.WORKER_ADMIN_KEY;
+}
 
 // Ticker autocomplete (Day 15): proxies Twelve Data's symbol_search so the
 // API key never has to live in the browser. The front end debounces calls to
@@ -103,6 +177,37 @@ async function searchSymbols(query, env) {
   }
 }
 
+// Day 19: ensures fx_rates has a cached rate at or before each holding's
+// buy_date for its buy_currency, so front-end/email cost-basis math can use
+// the ACTUAL rate on the day you bought instead of today's rate. Reuses the
+// chart backfill's range-fetch (fetchHistoricalFxRange) so one Frankfurter
+// call covers a whole currency's date range at once rather than one call per
+// holding. Best-effort and non-blocking: on any failure it just leaves the
+// gap uncached, and callers (app.js's computeRow, metrics.js) fall back to
+// today's rate exactly like before this feature existed.
+async function ensureBuyDateFxCoverage(env, sb, holdings, baseCurrency) {
+  try {
+    const earliestNeededByCurrency = {};
+    for (const h of holdings) {
+      if (!h.buy_currency || h.buy_currency === baseCurrency) continue;
+      const covered = await sb.getFxRateBefore(baseCurrency, h.buy_currency, `${h.buy_date}T23:59:59.999Z`).catch(() => null);
+      if (covered != null) continue;
+      if (!earliestNeededByCurrency[h.buy_currency] || h.buy_date < earliestNeededByCurrency[h.buy_currency]) {
+        earliestNeededByCurrency[h.buy_currency] = h.buy_date;
+      }
+    }
+    for (const [currency, sinceDate] of Object.entries(earliestNeededByCurrency)) {
+      const range = await fetchHistoricalFxRange(baseCurrency, [currency], sinceDate).catch(() => ({}));
+      const rows = Object.entries(range).flatMap(([date, rates]) =>
+        Object.entries(rates).map(([quote, rate]) => ({ base: baseCurrency, quote, rate, as_of: `${date}T12:00:00.000Z` }))
+      );
+      if (rows.length) await sb.insertRows("fx_rates", rows).catch((e) => console.error("Failed to cache buy-date FX (continuing anyway):", e.message));
+    }
+  } catch (e) {
+    console.error("ensureBuyDateFxCoverage failed (continuing anyway):", e.message);
+  }
+}
+
 // Cache-only refresh — no email, no daily_reports row. This is what the front
 // end calls right after you add a holding, so you're not stuck waiting for
 // tomorrow's cron just to see a price for something you just added. Works
@@ -119,6 +224,8 @@ async function refreshPricesOnly(env) {
     if (lastAsOf && Date.now() - new Date(lastAsOf).getTime() < REFRESH_THROTTLE_MS) {
       return { skipped: true, reason: "refreshed recently, throttled" };
     }
+
+    await ensureBuyDateFxCoverage(env, sb, holdings, baseCurrency);
 
     const tickers = holdings.map((h) => h.ticker);
     const priceCurrenciesNeeded = [...new Set(holdings.map((h) => h.buy_currency))];
@@ -173,6 +280,22 @@ async function backfillHistory(env) {
     const buyCurrencies = allHoldings.map((h) => h.buy_currency);
     const allQuoteCurrencies = [...new Set([...tickerCurrencies, ...buyCurrencies])];
     const fxHistory = await fetchHistoricalFxRange(baseCurrency, allQuoteCurrencies, earliestBuyDate);
+
+    // Day 19: also persist the FX history itself into fx_rates (not just use
+    // it transiently for the chart math above) — this is what lets cost-basis
+    // calculations later look up the ACTUAL rate on a holding's buy_date
+    // instead of always falling back to today's rate. One row per
+    // (currency, day) in the range, appended the same way live refreshes
+    // append rather than overwrite (fx_rates has no unique constraint by
+    // design — see schema.sql) — re-running backfill re-appends the same
+    // historical rows, which is harmless for correctness (lookups always
+    // take the closest match) but does grow the table on repeated runs.
+    const fxHistoryRows = Object.entries(fxHistory).flatMap(([date, rates]) =>
+      Object.entries(rates).map(([quote, rate]) => ({ base: baseCurrency, quote, rate, as_of: `${date}T12:00:00.000Z` }))
+    );
+    if (fxHistoryRows.length) {
+      await sb.insertRows("fx_rates", fxHistoryRows).catch((e) => console.error("Failed to cache historical FX range (continuing anyway):", e.message));
+    }
 
     const perUser = [];
     for (const user of users) {
@@ -240,6 +363,8 @@ async function backfillHistory(env) {
 // whatever set of holdings it's given, and cache the results. Pulled out into
 // one place so all three callers stay consistent instead of drifting.
 async function refreshSharedPriceFxCache(env, sb, holdings, baseCurrency) {
+  await ensureBuyDateFxCoverage(env, sb, holdings, baseCurrency);
+
   const tickers = [...new Set(holdings.map((h) => h.ticker))];
   const priceCurrenciesNeeded = [...new Set(holdings.map((h) => h.buy_currency))];
   const priceResults = await fetchPrices(tickers, env);
@@ -356,7 +481,19 @@ async function processUserDailyJob({ user, holdings, priceResults, fxRatesToday,
   let topNews = [];
 
   try {
-    metrics = computePortfolioMetrics({ holdings, pricesByTicker: priceResults, fxRatesToday, fxRatesYesterday, baseCurrency });
+    // Day 19: look up each holding's OWN buy-date FX rate (cached by
+    // ensureBuyDateFxCoverage, called earlier in refreshSharedPriceFxCache)
+    // instead of letting cost basis silently use today's rate. Missing
+    // coverage just means that holding falls back to today's rate below —
+    // never a hard failure.
+    const buyFxRatesById = {};
+    for (const h of holdings) {
+      if (!h.buy_currency || h.buy_currency === baseCurrency) continue;
+      const rate = await sb.getFxRateBefore(baseCurrency, h.buy_currency, `${h.buy_date}T23:59:59.999Z`).catch(() => null);
+      if (rate != null) buyFxRatesById[h.id] = rate;
+    }
+
+    metrics = computePortfolioMetrics({ holdings, pricesByTicker: priceResults, fxRatesToday, fxRatesYesterday, baseCurrency, buyFxRatesById });
     if (metrics.flagged.length > 0) status = "partial"; // graceful degradation, not silence
 
     // Append today's real value to this user's chart history (Day 14).
