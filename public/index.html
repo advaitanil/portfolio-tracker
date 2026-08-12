@@ -5,8 +5,32 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Portfolio Tracker</title>
   <link rel="stylesheet" href="style.css" />
+  <!-- Set the theme attribute BEFORE the page paints (inline, blocking, in
+       <head>) so there's no flash of the wrong theme on load — by the time
+       app.js runs at the bottom of <body>, the browser has already rendered
+       once. Falls back to the OS-level light/dark preference the first time,
+       then remembers whatever the user picks via the toggle. -->
+  <script>
+    (function () {
+      var saved = localStorage.getItem("theme");
+      var wantsLight = saved ? saved === "light" : window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches;
+      if (wantsLight) document.documentElement.setAttribute("data-theme", "light");
+    })();
+  </script>
 </head>
 <body>
+  <!-- Always-visible theme toggle — sits outside the login/app sections so
+       it works before you've signed in too. -->
+  <button type="button" id="themeToggleBtn" class="theme-toggle" aria-label="Switch theme" title="Switch light/dark theme">
+    <svg class="icon-sun" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="12" cy="12" r="4"></circle>
+      <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"></path>
+    </svg>
+    <svg class="icon-moon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+    </svg>
+  </button>
+
   <!-- Login gate: this project's brief (Section 2) explicitly says "single
        portfolio, no login, keep it simple" — this gate is an intentional
        deviation from that, added on request. See README for the note. -->

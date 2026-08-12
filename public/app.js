@@ -6,6 +6,23 @@
 
 const sb = window.supabase.createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY);
 const BASE_CURRENCY = window.BASE_CURRENCY || "USD";
+
+// Light/dark theme toggle (Day 18). The actual theme is applied by a tiny
+// inline script in <head> (runs before first paint, avoids a flash of the
+// wrong theme) — this just handles the click and remembers the choice.
+// Chart colors (renderValueChart, below) read CSS custom properties via
+// inline `style`, not hardcoded hex, so the chart repaints correctly on
+// toggle with no extra work needed here.
+document.getElementById("themeToggleBtn").addEventListener("click", () => {
+  const isLight = document.documentElement.getAttribute("data-theme") === "light";
+  if (isLight) {
+    document.documentElement.removeAttribute("data-theme");
+    localStorage.setItem("theme", "dark");
+  } else {
+    document.documentElement.setAttribute("data-theme", "light");
+    localStorage.setItem("theme", "light");
+  }
+});
 const STALE_AFTER_MS = 1000 * 60 * 60 * 24; // stocks/ETFs trade intraday — flag stale after 24h
 // Day 12: funds priced once/day (NAV) shouldn't be flagged stale on the same
 // clock as an intraday stock quote. A NAV struck yesterday afternoon is still
@@ -598,7 +615,12 @@ function renderValueChart(svg, rawPoints) {
   const areaPath = `${linePath} L ${coords[coords.length - 1].x.toFixed(1)},${floorY} L ${coords[0].x.toFixed(1)},${floorY} Z`;
 
   const trendUp = values[values.length - 1] >= values[0];
-  const stroke = trendUp ? "#3ddc97" : "#ff6b6b";
+  // CSS custom properties, not literal hex — these resolve through the
+  // `style` attribute (SVG presentation attributes like a bare fill="..."
+  // do NOT support var()), so the chart automatically repaints in the
+  // right colors for whichever theme is active, light or dark, with no
+  // JS re-render needed on theme toggle.
+  const trendColor = trendUp ? "var(--green)" : "var(--red)";
 
   // Dashed reference lines at 25/50/75% of the visible range, each labelled —
   // gives the eye something to measure against instead of just two numbers
@@ -612,9 +634,9 @@ function renderValueChart(svg, rawPoints) {
       // good enough for a currency string, doesn't need to be exact.
       const labelWidth = label.length * 6.2 + 8;
       const boxX = width - padX - labelWidth;
-      return `<line x1="${padX}" y1="${gy.toFixed(1)}" x2="${width - padX}" y2="${gy.toFixed(1)}" stroke="#2a2e3a" stroke-width="1" stroke-dasharray="3,4"></line>
-        <rect x="${boxX.toFixed(1)}" y="${(gy - 15).toFixed(1)}" width="${labelWidth.toFixed(1)}" height="15" fill="#171a21" fill-opacity="0.9" rx="3"></rect>
-        <text x="${(width - padX - 4).toFixed(1)}" y="${(gy - 4).toFixed(1)}" fill="#9aa0ac" font-size="10" text-anchor="end">${label}</text>`;
+      return `<line x1="${padX}" y1="${gy.toFixed(1)}" x2="${width - padX}" y2="${gy.toFixed(1)}" style="stroke:var(--border)" stroke-width="1" stroke-dasharray="3,4"></line>
+        <rect x="${boxX.toFixed(1)}" y="${(gy - 15).toFixed(1)}" width="${labelWidth.toFixed(1)}" height="15" style="fill:var(--panel);fill-opacity:0.9" rx="3"></rect>
+        <text x="${(width - padX - 4).toFixed(1)}" y="${(gy - 4).toFixed(1)}" style="fill:var(--muted)" font-size="10" text-anchor="end">${label}</text>`;
     })
     .join("");
 
@@ -626,14 +648,14 @@ function renderValueChart(svg, rawPoints) {
   svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
   svg.innerHTML = `
     ${gridLines}
-    <path d="${areaPath}" fill="${stroke}" fill-opacity="0.12" stroke="none"></path>
-    <path d="${linePath}" fill="none" stroke="${stroke}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"></path>
-    <rect x="${(padX - 4).toFixed(1)}" y="4" width="${maxLabelWidth.toFixed(1)}" height="16" fill="#171a21" fill-opacity="0.9" rx="3"></rect>
-    <text x="${padX}" y="16" fill="#9aa0ac" font-size="11">${maxLabel}</text>
-    <rect x="${(padX - 4).toFixed(1)}" y="${height - 22}" width="${minLabelWidth.toFixed(1)}" height="16" fill="#171a21" fill-opacity="0.9" rx="3"></rect>
-    <text x="${padX}" y="${height - 8}" fill="#9aa0ac" font-size="11">${minLabel}</text>
-    <line id="chartHoverLine" x1="0" y1="${padY}" x2="0" y2="${height - padY}" stroke="#9aa0ac" stroke-width="1" stroke-dasharray="2,3" style="display: none"></line>
-    <circle id="chartHoverDot" r="4" fill="${stroke}" stroke="#0b0d12" stroke-width="1.5" style="display: none"></circle>
+    <path d="${areaPath}" style="fill:${trendColor};fill-opacity:0.12" stroke="none"></path>
+    <path d="${linePath}" fill="none" style="stroke:${trendColor}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"></path>
+    <rect x="${(padX - 4).toFixed(1)}" y="4" width="${maxLabelWidth.toFixed(1)}" height="16" style="fill:var(--panel);fill-opacity:0.9" rx="3"></rect>
+    <text x="${padX}" y="16" style="fill:var(--muted)" font-size="11">${maxLabel}</text>
+    <rect x="${(padX - 4).toFixed(1)}" y="${height - 22}" width="${minLabelWidth.toFixed(1)}" height="16" style="fill:var(--panel);fill-opacity:0.9" rx="3"></rect>
+    <text x="${padX}" y="${height - 8}" style="fill:var(--muted)" font-size="11">${minLabel}</text>
+    <line id="chartHoverLine" x1="0" y1="${padY}" x2="0" y2="${height - padY}" style="stroke:var(--muted); display: none" stroke-width="1" stroke-dasharray="2,3"></line>
+    <circle id="chartHoverDot" r="4" style="fill:${trendColor}; stroke:var(--panel); display: none" stroke-width="1.5"></circle>
   `;
 
   // Hover/tap-to-inspect (Day 17): find the nearest plotted point to the
