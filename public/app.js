@@ -655,7 +655,11 @@ function renderValueChart(svg, rawPoints) {
   // clip its own buy-in line off the top of the chart.
   const costValues = points.map((p) => p.total_cost).filter((v) => v != null);
   const allValues = costValues.length ? values.concat(costValues) : values;
-  const min = Math.min(...allValues);
+  // Axis floors at $0 (Day 22) rather than the lowest plotted value — with
+  // two lines being compared directly (value vs. buy-in), a zoomed-in axis
+  // exaggerates the visual size of any gap/step between them. Math.min(0, …)
+  // just guards against an actual negative value ever showing up.
+  const min = Math.min(0, ...allValues);
   const max = Math.max(...allValues);
   const range = max - min || 1; // flat line (or single point): avoid divide-by-zero
 
