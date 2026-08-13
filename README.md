@@ -164,37 +164,29 @@ that alone satisfies Day 2's "done when".
 
 ### 3a. Google sign-in and "forgot password" (Day 21)
 
-Both are implemented in the front end already (`public/index.html` /
-`public/app.js` — the "Continue with Google" button and "Forgot password?"
-link on the login screen). Password reset needs zero extra setup beyond what
-Supabase gives you out of the box; Google sign-in needs a one-time dashboard
-step I can't do for you (it requires your own Google Cloud login):
+Both are implemented in the front end (`public/index.html` / `public/app.js`
+— the "Continue with Google" button and "Forgot password?" link on the login
+screen) AND fully configured already, end-to-end tested against the live
+site on 2026-08-13:
+- Supabase Auth > URL Configuration: Site URL set to `https://portfolio.rexorot.com`
+  (was previously pointing at the *Worker's* URL — a leftover default that
+  would have broken any redirect-based flow, fixed as part of this), Redirect
+  URLs includes `https://portfolio.rexorot.com/**`.
+- Google Cloud project "Portfolio Tracker" created, OAuth consent screen
+  configured (External, published to Production — not stuck in "Testing",
+  so any Google account can sign in, not just an allow-listed test list),
+  OAuth Client ID created (Web application) with the authorized origin and
+  Supabase's `/auth/v1/callback` redirect URI.
+- Supabase Auth > Providers > Google: enabled, Client ID/Secret saved.
 
-**Forgot password** — works immediately, but double check Supabase's Auth >
-URL Configuration has your site's real URL(s) listed under "Redirect URLs"
-(e.g. `https://portfolio.rexorot.com`, plus your `*.pages.dev` URL if you
-still use it) and that "Site URL" is set to your primary domain. Without
-this, the reset-password link Supabase emails will redirect somewhere
-Supabase refuses to send the session to, and the link will silently fail.
+If you ever need to rotate the Google OAuth secret or add another
+authorized domain (e.g. a new custom domain), that's in Google Cloud
+Console under APIs & Services > Credentials > "Portfolio Tracker Web", and
+the corresponding value goes in Supabase Auth > Providers > Google.
 
-**Google sign-in** — needs a Google OAuth Client ID/Secret:
-1. In [Google Cloud Console](https://console.cloud.google.com) → APIs &
-   Services → Credentials → Create OAuth client ID → Application type "Web
-   application".
-2. Authorized redirect URI: `https://<your-project-ref>.supabase.co/auth/v1/callback`
-   (Supabase's Auth > Providers > Google page shows you this exact URL —
-   copy it from there rather than typing it by hand).
-3. Copy the generated Client ID and Client Secret.
-4. In Supabase: Auth > Providers > Google → toggle it on → paste the Client
-   ID and Client Secret → Save.
-5. Same "Redirect URLs" caveat as above — add your site's URL(s) under Auth
-   > URL Configuration, or the post-login redirect back to the app will fail
-   even though the Google login itself succeeded.
-
-Until step 4 is done, clicking "Continue with Google" will show an error
-from Supabase (something like "Unsupported provider") instead of doing
-anything harmful — the front-end code doesn't need to change once the
-provider is turned on.
+Forgot-password needed no extra setup beyond the URL Configuration fix
+above — Supabase's built-in reset-password email flow works as soon as the
+Site URL/Redirect URLs are correct.
 
 ### 4. Worker
 
