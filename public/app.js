@@ -1489,7 +1489,14 @@ function showApp(user) {
 function showLogin() {
   currentUserId = null;
   document.getElementById("appContent").style.display = "none";
+  document.getElementById("resetPasswordSection").style.display = "none";
   document.getElementById("loginSection").style.display = "";
+}
+
+function showResetPassword() {
+  document.getElementById("appContent").style.display = "none";
+  document.getElementById("loginSection").style.display = "none";
+  document.getElementById("resetPasswordSection").style.display = "";
 }
 
 document.getElementById("loginForm").addEventListener("submit", async (e) => {
@@ -1534,9 +1541,100 @@ document.getElementById("signOutBtn").addEventListener("click", async () => {
   showLogin();
 });
 
+// --- Sign in with Google (OAuth) ---
+// Needs the Google provider turned on in Supabase (Auth > Providers) with a
+// Google Cloud OAuth Client ID/Secret, plus this site's URL added under
+// Auth > URL Configuration > Redirect URLs — see README "Google sign-in
+// setup". redirectTo sends the browser back to wherever this page is
+// currently hosted (works for both the *.pages.dev URL and a custom domain
+// without hardcoding either).
+document.getElementById("googleSignInBtn").addEventListener("click", async () => {
+  const errEl = document.getElementById("loginError");
+  errEl.textContent = "";
+  const { error } = await sb.auth.signInWithOAuth({
+    provider: "google",
+    options: { redirectTo: window.location.origin },
+  });
+  // A successful call navigates the browser away to Google immediately —
+  // this only returns/shows an error if the redirect itself couldn't start
+  // (e.g. the provider isn't enabled yet in Supabase).
+  if (error) errEl.textContent = error.message;
+});
+
+// --- Forgot password ---
+// Reuses whatever's currently typed into the email field above. Supabase
+// emails a link back to redirectTo with a one-time recovery token in the URL
+// hash; the Supabase client auto-detects that on load and fires the
+// PASSWORD_RECOVERY event handled below, rather than this page parsing the
+// token itself.
+document.getElementById("forgotPasswordBtn").addEventListener("click", async () => {
+  const errEl = document.getElementById("loginError");
+  const hintEl = document.getElementById("loginHint");
+  errEl.textContent = "";
+  hintEl.textContent = "";
+  const email = document.querySelector('#loginForm input[name="email"]').value.trim();
+  if (!email) {
+    errEl.textContent = 'Enter your email above first, then click "Forgot password?".';
+    return;
+  }
+  const { error } = await sb.auth.resetPasswordForEmail(email, {
+    redirectTo: window.location.origin,
+  });
+  if (error) {
+    errEl.textContent = error.message;
+    return;
+  }
+  hintEl.textContent = `Password reset email sent to ${email} — check your inbox for the link.`;
+});
+
+document.getElementById("resetPasswordForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const errEl = document.getElementById("resetPasswordError");
+  const hintEl = document.getElementById("resetPasswordHint");
+  errEl.textContent = "";
+  hintEl.textContent = "";
+
+  const form = new FormData(e.target);
+  const password = form.get("password");
+  const confirmPassword = form.get("confirmPassword");
+  if (password !== confirmPassword) {
+    errEl.textContent = "Passwords don't match.";
+    return;
+  }
+
+  const { data, error } = await sb.auth.updateUser({ password });
+  if (error) {
+    errEl.textContent = error.message;
+    return;
+  }
+  inPasswordRecovery = false;
+  hintEl.textContent = "Password updated — signing you in…";
+  showApp(data.user);
+});
+
+document.getElementById("cancelResetBtn").addEventListener("click", async () => {
+  inPasswordRecovery = false;
+  await sb.auth.signOut(); // the recovery link issues a real (if temporary) session — drop it
+  showLogin();
+});
+
+// Supabase's client detects a password-recovery link in the URL on load and
+// fires this event (with a valid, if temporary, session already attached) —
+// route to the "set a new password" screen instead of straight into the
+// dashboard. inPasswordRecovery guards the getSession() check just below,
+// since both can resolve in either order.
+let inPasswordRecovery = false;
+sb.auth.onAuthStateChange((event) => {
+  if (event === "PASSWORD_RECOVERY") {
+    inPasswordRecovery = true;
+    showResetPassword();
+  }
+});
+
 // On load, pick up an existing session (Supabase persists it in
 // localStorage) so you're not asked to log in again on every visit.
 sb.auth.getSession().then(({ data: { session } }) => {
+  if (inPasswordRecovery) return; // already routed to showResetPassword() above
   if (session) showApp(session.user);
   else showLogin();
 });

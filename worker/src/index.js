@@ -229,7 +229,13 @@ async function refreshPricesOnly(env) {
 
     const tickers = holdings.map((h) => h.ticker);
     const priceCurrenciesNeeded = [...new Set(holdings.map((h) => h.buy_currency))];
-    const priceResults = await fetchPrices(tickers, env);
+    const { results: priceResults, batchFailed } = await fetchPrices(tickers, env);
+    if (batchFailed) {
+      // Whole Twelve Data call failed — bail out before writing anything, so
+      // the last good cached prices stay authoritative instead of getting
+      // shadowed by a null/stale row for every ticker (Day 20 bug).
+      throw new Error("Twelve Data price fetch failed entirely — previous prices kept, nothing overwritten. Check TWELVE_DATA_API_KEY / rate limits.");
+    }
     const currenciesInPrices = Object.values(priceResults).map((p) => p.currency).filter(Boolean);
     const allQuoteCurrencies = [...new Set([...priceCurrenciesNeeded, ...currenciesInPrices])];
     const fxRatesToday = await fetchFxRates(baseCurrency, allQuoteCurrencies);
@@ -367,7 +373,17 @@ async function refreshSharedPriceFxCache(env, sb, holdings, baseCurrency) {
 
   const tickers = [...new Set(holdings.map((h) => h.ticker))];
   const priceCurrenciesNeeded = [...new Set(holdings.map((h) => h.buy_currency))];
-  const priceResults = await fetchPrices(tickers, env);
+  const { results: priceResults, batchFailed } = await fetchPrices(tickers, env);
+  if (batchFailed) {
+    // Same reasoning as refreshPricesOnly above: never let a total fetch
+    // failure overwrite the prices cache OR flow into today's chart point
+    // (processUserDailyJob would otherwise upsert a $0 into
+    // portfolio_value_history since every holding's price would be missing).
+    // Throwing here means neither happens — callers' existing try/catch
+    // blocks (runDailyJob, runDailyJobForUser, refreshPricesOnly) already
+    // surface this as a clean "failed" status instead of a silent stale $0.
+    throw new Error("Twelve Data price fetch failed entirely — previous prices kept, nothing overwritten. Check TWELVE_DATA_API_KEY / rate limits.");
+  }
   const currenciesInPrices = Object.values(priceResults).map((p) => p.currency).filter(Boolean);
   const allQuoteCurrencies = [...new Set([...priceCurrenciesNeeded, ...currenciesInPrices])];
   const fxRatesToday = await fetchFxRates(baseCurrency, allQuoteCurrencies);

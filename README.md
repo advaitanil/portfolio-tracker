@@ -162,6 +162,40 @@ Cloudflare Pages:
 Confirm you get a live public URL where you can add/see/delete holdings —
 that alone satisfies Day 2's "done when".
 
+### 3a. Google sign-in and "forgot password" (Day 21)
+
+Both are implemented in the front end already (`public/index.html` /
+`public/app.js` — the "Continue with Google" button and "Forgot password?"
+link on the login screen). Password reset needs zero extra setup beyond what
+Supabase gives you out of the box; Google sign-in needs a one-time dashboard
+step I can't do for you (it requires your own Google Cloud login):
+
+**Forgot password** — works immediately, but double check Supabase's Auth >
+URL Configuration has your site's real URL(s) listed under "Redirect URLs"
+(e.g. `https://portfolio.rexorot.com`, plus your `*.pages.dev` URL if you
+still use it) and that "Site URL" is set to your primary domain. Without
+this, the reset-password link Supabase emails will redirect somewhere
+Supabase refuses to send the session to, and the link will silently fail.
+
+**Google sign-in** — needs a Google OAuth Client ID/Secret:
+1. In [Google Cloud Console](https://console.cloud.google.com) → APIs &
+   Services → Credentials → Create OAuth client ID → Application type "Web
+   application".
+2. Authorized redirect URI: `https://<your-project-ref>.supabase.co/auth/v1/callback`
+   (Supabase's Auth > Providers > Google page shows you this exact URL —
+   copy it from there rather than typing it by hand).
+3. Copy the generated Client ID and Client Secret.
+4. In Supabase: Auth > Providers > Google → toggle it on → paste the Client
+   ID and Client Secret → Save.
+5. Same "Redirect URLs" caveat as above — add your site's URL(s) under Auth
+   > URL Configuration, or the post-login redirect back to the app will fail
+   even though the Google login itself succeeded.
+
+Until step 4 is done, clicking "Continue with Google" will show an error
+from Supabase (something like "Unsupported provider") instead of doing
+anything harmful — the front-end code doesn't need to change once the
+provider is turned on.
+
 ### 4. Worker
 
 ```
@@ -270,6 +304,7 @@ for more frequent news refreshes.
 - Metrics logic is duplicated between `public/app.js` (for the live dashboard) and `worker/src/lib/metrics.js` (for the email) rather than shared — acceptable for this scope, but a real product would extract one shared module.
 - No automated tests yet. Given the brief's emphasis on correctness, adding a small test file for `metrics.js` covering the hand-verified examples from Day 4 would be a good next step.
 - `fx_rates` is append-only with no unique constraint (by design — see schema.sql), so re-running `/backfill-history` re-appends the same historical rows each time rather than upserting. Harmless for correctness (lookups always take the closest match) but the table grows on every re-run.
+- **Fixed (Day 20):** a total Twelve Data outage/rate-limit during a "Run now" or scheduled run used to write a null/stale row for every ticker into the append-only `prices` table, which — because readers always take the most recent row — permanently shadowed the last good cached price (symptom: every holding shows "stale" and total value drops to $0, even though nothing is actually wrong with the ticker data itself). `fetchPrices()` now distinguishes "the whole batch call failed" from "one ticker has no data," and `refreshSharedPriceFxCache`/`refreshPricesOnly` abort before writing anything — including today's `portfolio_value_history` point — when the whole batch fails. "Run now" and "Fetch prices" now surface a clear `Failed: ...` message instead of silently corrupting the cache. Note "Run now" still has no throttle (unlike `/refresh-prices`'s 2-minute one), so heavy manual testing can still burn through Twelve Data's daily credit limit — that part is unchanged, just no longer destructive when it happens.
 
 ## Disclaimer (required, Section 10)
 

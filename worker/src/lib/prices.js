@@ -6,10 +6,19 @@ import { withRetry } from "./retry.js";
 
 const TWELVE_DATA_BASE = "https://api.twelvedata.com";
 
+// Return shape: { results, batchFailed }. batchFailed distinguishes "the
+// whole Twelve Data call errored out" (rate limit, bad API key, network
+// blip — nothing here is trustworthy) from "this one ticker has no data"
+// (delisted/typo — every OTHER ticker's price is still fine). Callers use
+// batchFailed to decide whether it's safe to cache these results: writing a
+// batch-failure result into the append-only prices table would flag every
+// holding as stale and shadow the last GOOD cached price, since readers
+// always take the most recent row per ticker (see Day 20 bug: "Run now"
+// hit a Twelve Data failure and every holding went stale/$0 as a result).
 export async function fetchPrices(tickers, env) {
   const unique = [...new Set(tickers)];
   const results = {};
-  if (unique.length === 0) return results;
+  if (unique.length === 0) return { results, batchFailed: false };
 
   const url = `${TWELVE_DATA_BASE}/quote?symbol=${unique.join(",")}&apikey=${env.TWELVE_DATA_API_KEY}`;
 
@@ -26,6 +35,8 @@ export async function fetchPrices(tickers, env) {
     console.error("fetchPrices failed entirely — every holding will be flagged stale:", err.message);
     return null;
   });
+
+  const batchFailed = data === null;
 
   // Single symbol -> one flat object. Multiple symbols -> {SYMBOL: {...}, ...}.
   const normalized = data && unique.length === 1 && !data[unique[0]] ? { [unique[0]]: data } : data;
@@ -55,5 +66,5 @@ export async function fetchPrices(tickers, env) {
       error: null,
     };
   }
-  return results;
+  return { results, batchFailed };
 }
