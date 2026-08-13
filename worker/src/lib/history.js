@@ -100,6 +100,25 @@ export function computeHistoryValues({ holdings, priceHistory, fxHistory, baseCu
     return result;
   };
 
+  // Day 22: cost basis ("total buy-in") per holding, for the chart's second
+  // line. Unlike market value, buy_price/buy_currency are static — no
+  // day-by-day series needed — so this is computed once up front per
+  // holding, using the FX rate in effect on that holding's OWN buy_date
+  // (carried forward from fxHistory, which already covers the full backfill
+  // range), same convention as the Day 19 cost-basis-accuracy fix elsewhere.
+  // A holding whose currency has no FX coverage at its buy_date is left out
+  // (null) rather than guessed — same "skip rather than guess" philosophy
+  // as the price lookups below.
+  const costBasisByHolding = {};
+  for (const h of holdings) {
+    if (h.buy_currency === baseCurrency) {
+      costBasisByHolding[h.id] = h.quantity * h.buy_price;
+      continue;
+    }
+    const rate = carryForward(fxSorted[h.buy_currency] || [], h.buy_date);
+    costBasisByHolding[h.id] = rate ? h.quantity * (h.buy_price / rate) : null;
+  }
+
   const earliestBuyDate = holdings.reduce((min, h) => (h.buy_date < min ? h.buy_date : min), holdings[0].buy_date);
   const today = new Date().toISOString().slice(0, 10);
 
@@ -111,26 +130,47 @@ export function computeHistoryValues({ holdings, priceHistory, fxHistory, baseCu
     const dateStr = cursor.toISOString().slice(0, 10);
     let total = 0;
     let anyPriced = false;
+    let costTotal = 0;
+    let anyCost = false;
 
     for (const h of holdings) {
       if (dateStr < h.buy_date) continue; // not owned yet on this date
 
       const info = priceHistory[h.ticker];
       const price = info ? carryForward(priceSorted[h.ticker] || [], dateStr) : null;
-      if (price == null) continue; // no price data this far back for this ticker — skip it for this day
-
-      const ccy = info.currency || baseCurrency;
-      let priceInBase = price;
-      if (ccy !== baseCurrency) {
-        const rate = carryForward(fxSorted[ccy] || [], dateStr);
-        if (!rate) continue; // no FX data this far back — skip rather than guess
-        priceInBase = price / rate;
+      if (price != null) {
+        const ccy = info.currency || baseCurrency;
+        let priceInBase = price;
+        let ok = true;
+        if (ccy !== baseCurrency) {
+          const rate = carryForward(fxSorted[ccy] || [], dateStr);
+          if (!rate) ok = false; // no FX data this far back — skip rather than guess
+          else priceInBase = price / rate;
+        }
+        if (ok) {
+          total += h.quantity * priceInBase;
+          anyPriced = true;
+        }
       }
-      total += h.quantity * priceInBase;
-      anyPriced = true;
+
+      const costBasis = costBasisByHolding[h.id];
+      if (costBasis != null) {
+        costTotal += costBasis;
+        anyCost = true;
+      }
     }
 
-    if (anyPriced) points.push({ date: dateStr, total_value: Math.round(total * 100) / 100 });
+    // total_value stays required (schema: not null) — only push a point when
+    // we actually have a priced total, same as before this change. total_cost
+    // just rides along on that same point when available; it never creates a
+    // point by itself.
+    if (anyPriced) {
+      points.push({
+        date: dateStr,
+        total_value: Math.round(total * 100) / 100,
+        total_cost: anyCost ? Math.round(costTotal * 100) / 100 : null,
+      });
+    }
     cursor.setUTCDate(cursor.getUTCDate() + 1);
   }
   return points;

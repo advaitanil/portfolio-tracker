@@ -105,6 +105,15 @@ create table if not exists portfolio_value_history (
   user_id       uuid not null references auth.users (id) on delete cascade,
   date          date not null,
   total_value   numeric not null,
+  -- Day 22: total cost basis (buy-in) as of this date — quantity * buy_price
+  -- for every holding owned by this date, converted at each holding's OWN
+  -- buy-date FX rate (same convention as the cost-basis fix in metrics.js),
+  -- not today's rate. Nullable: older backfilled rows from before this
+  -- column existed won't have it, and any date where a holding's buy-date FX
+  -- rate genuinely isn't cached yet is left null rather than guessed. Powers
+  -- the chart's second "total buy-in" line — the gap between this and
+  -- total_value at any point is unrealised profit/loss at that date.
+  total_cost    numeric,
   base_currency text not null,
   source        text not null default 'backfill', -- 'backfill' | 'daily_job'
   created_at    timestamptz not null default now()
@@ -131,6 +140,7 @@ create table if not exists portfolio_history (
   portfolio_id  uuid not null references portfolios (id) on delete cascade,
   date          date not null,
   total_value   numeric not null,
+  total_cost    numeric, -- Day 22: see portfolio_value_history.total_cost above, same idea scoped per portfolio
   base_currency text not null,
   source        text not null default 'backfill', -- 'backfill' | 'daily_job' | 'live_update'
   created_at    timestamptz not null default now()
@@ -250,3 +260,16 @@ create policy "users manage own realized_gains" on realized_gains for all using 
 -- After running this, visit <your-worker>/backfill-history once more to
 -- seed real historical per-portfolio data — until then, a portfolio's chart
 -- will only show "today" (from live updates) going forward.
+
+-- ── Migration: adding the cost-basis ("total buy-in") chart line (Day 22) ──
+-- Run this once if your tables predate the total_cost column above:
+--
+--   alter table portfolio_value_history add column if not exists total_cost numeric;
+--   alter table portfolio_history add column if not exists total_cost numeric;
+--
+-- Existing rows get total_cost = null, which the chart just skips over (no
+-- buy-in line for dates before this migration ran). Visit
+-- <your-worker>/backfill-history once more afterwards to backfill real
+-- historical cost-basis values using each holding's actual buy-date FX
+-- rate — until then the buy-in line only starts from "today" (live updates)
+-- going forward.

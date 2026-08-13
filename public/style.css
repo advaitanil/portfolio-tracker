@@ -255,6 +255,12 @@ footer { margin-top: 40px; color: var(--muted); font-size: 0.75rem; border-top: 
 }
 .chart-caption { color: var(--muted); font-size: 0.8rem; margin-top: 6px; }
 
+.chart-legend { display: flex; gap: 18px; margin-top: 10px; flex-wrap: wrap; }
+.chart-legend-item { display: inline-flex; align-items: center; gap: 6px; font-size: 0.78rem; color: var(--muted); }
+.chart-legend-swatch { display: inline-block; width: 16px; height: 0; border-top-width: 2.5px; border-top-style: solid; }
+.chart-legend-swatch.swatch-value { border-top-color: var(--text); }
+.chart-legend-swatch.swatch-cost { border-top-color: var(--muted); border-top-style: dashed; border-top-width: 1.75px; }
+
 .quick-actions { display: flex; align-items: center; gap: 10px; margin: 4px 0 24px; flex-wrap: wrap; }
 .quick-actions button { font-size: 0.82rem; padding: 7px 14px; }
 .quick-actions-status { color: var(--muted); font-size: 0.82rem; }

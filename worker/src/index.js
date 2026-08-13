@@ -316,7 +316,7 @@ async function backfillHistory(env) {
 
       await sb.upsertRows(
         "portfolio_value_history",
-        points.map((p) => ({ date: p.date, total_value: p.total_value, base_currency: baseCurrency, source: "backfill", user_id: user.id })),
+        points.map((p) => ({ date: p.date, total_value: p.total_value, total_cost: p.total_cost, base_currency: baseCurrency, source: "backfill", user_id: user.id })),
         "user_id,date"
       );
 
@@ -338,6 +338,7 @@ async function backfillHistory(env) {
           pPoints.map((p) => ({
             date: p.date,
             total_value: p.total_value,
+            total_cost: p.total_cost,
             base_currency: baseCurrency,
             source: "backfill",
             user_id: user.id,
@@ -513,11 +514,19 @@ async function processUserDailyJob({ user, holdings, priceResults, fxRatesToday,
     if (metrics.flagged.length > 0) status = "partial"; // graceful degradation, not silence
 
     // Append today's real value to this user's chart history (Day 14).
+    // Note: metrics.totalCost (metrics.js) only sums cost basis for holdings
+    // that ALSO got a valid current price that day (it reuses the same
+    // `valid` filter as totalValue) — so a holding with a genuinely failed
+    // price fetch drops out of both totals together here, same pre-existing
+    // simplification the daily email already uses. The front end's own live
+    // chart-point upsert (app.js loadHoldings) is more precise: it sums cost
+    // basis independently of price availability, since buy-in doesn't
+    // actually depend on today's price at all.
     const todayStr = new Date().toISOString().slice(0, 10);
     await sb
       .upsertRows(
         "portfolio_value_history",
-        [{ date: todayStr, total_value: metrics.totalValue, base_currency: baseCurrency, source: "daily_job", user_id: user.id }],
+        [{ date: todayStr, total_value: metrics.totalValue, total_cost: metrics.totalCost, base_currency: baseCurrency, source: "daily_job", user_id: user.id }],
         "user_id,date"
       )
       .catch((e) => console.error(`[${user.email}] Failed to append value history (continuing anyway):`, e.message));
@@ -526,22 +535,36 @@ async function processUserDailyJob({ user, holdings, priceResults, fxRatesToday,
     // (computePortfolioMetrics does holdings.map(...)), so zip by index
     // rather than matching on ticker: a ticker can now legitimately appear in
     // more than one of a user's portfolios, and a ticker-based lookup would
-    // silently attribute both to whichever one it found first.
-    const valueByPortfolio = {};
+    // silently attribute both to whichever one it found first. Value and cost
+    // are accumulated independently (Day 22) — a holding with a missing
+    // price still contributes its cost basis even though it can't contribute
+    // a current value that day.
+    const portfolioTotals = {};
     holdings.forEach((h, i) => {
       if (!h.portfolio_id) return;
       const r = metrics.holdings[i];
-      if (!r || r.currentValue == null) return;
-      valueByPortfolio[h.portfolio_id] = (valueByPortfolio[h.portfolio_id] || 0) + r.currentValue;
+      if (!r) return;
+      const entry = (portfolioTotals[h.portfolio_id] ??= { value: 0, cost: 0, hasValue: false, hasCost: false });
+      if (r.currentValue != null) {
+        entry.value += r.currentValue;
+        entry.hasValue = true;
+      }
+      if (r.costBasis != null) {
+        entry.cost += r.costBasis;
+        entry.hasCost = true;
+      }
     });
-    const portfolioHistoryRows = Object.entries(valueByPortfolio).map(([portfolio_id, total_value]) => ({
-      date: todayStr,
-      total_value,
-      base_currency: baseCurrency,
-      source: "daily_job",
-      user_id: user.id,
-      portfolio_id,
-    }));
+    const portfolioHistoryRows = Object.entries(portfolioTotals)
+      .filter(([, t]) => t.hasValue) // total_value is required (schema: not null) — same as before this change
+      .map(([portfolio_id, t]) => ({
+        date: todayStr,
+        total_value: t.value,
+        total_cost: t.hasCost ? t.cost : null,
+        base_currency: baseCurrency,
+        source: "daily_job",
+        user_id: user.id,
+        portfolio_id,
+      }));
     if (portfolioHistoryRows.length) {
       await sb
         .upsertRows("portfolio_history", portfolioHistoryRows, "portfolio_id,date")

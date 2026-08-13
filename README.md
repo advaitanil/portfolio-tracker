@@ -188,6 +188,19 @@ Forgot-password needed no extra setup beyond the URL Configuration fix
 above — Supabase's built-in reset-password email flow works as soon as the
 Site URL/Redirect URLs are correct.
 
+### 3b. "Total buy-in" chart line (Day 22)
+
+The value chart now plots a second line — total cost basis (what you
+actually paid, in base currency, at each holding's own buy-date FX rate) —
+dashed and muted, alongside the market-value line. The gap between the two
+lines at any point is unrealised profit/loss on that date. Needs a schema
+migration if your database predates this (see schema.sql's "Migration:
+adding the cost-basis" block near the bottom — two `alter table ... add
+column if not exists total_cost numeric` statements). After running it,
+visit `<your-worker>/backfill-history` once to backfill real historical
+buy-in values; until then the buy-in line only starts from "today" onward
+(from live updates/the next scheduled run).
+
 ### 4. Worker
 
 ```

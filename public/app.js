@@ -215,7 +215,7 @@ function computeRow(holding, priceRow, fxRates, buyFxOverride) {
     priceRow.is_stale ||
     Date.now() - new Date(priceRow.as_of).getTime() > staleThreshold;
 
-  return { currentValue, gainAbs, gainPct, dayChangePct, priceInBase, isStale, isFund, priceRow };
+  return { currentValue, costBasis, gainAbs, gainPct, dayChangePct, priceInBase, isStale, isFund, priceRow };
 }
 
 async function loadHoldings() {
@@ -250,14 +250,20 @@ async function loadHoldings() {
     ...computeRow(h, prices[h.ticker], fxRates, buyFxByHolding.get(`${h.buy_currency}|${h.buy_date}`)),
   }));
   const wholeAccountValue = allRows.reduce((s, r) => s + (r.currentValue || 0), 0);
+  // Cost basis (Day 22, for the chart's "total buy-in" line) doesn't depend
+  // on price data at all, so it's summed independently of currentValue — a
+  // holding with a missing/stale price still contributes its buy-in.
+  const wholeAccountCost = allRows.reduce((s, r) => s + (r.costBasis || 0), 0);
 
   // Per-portfolio totals — feeds each portfolio's own chart view. Holdings
   // with no portfolio_id aren't part of any portfolio's series (only the
   // whole-account one above).
   const valueByPortfolio = {};
+  const costByPortfolio = {};
   for (const r of allRows) {
-    if (!r.h.portfolio_id || !r.currentValue) continue;
-    valueByPortfolio[r.h.portfolio_id] = (valueByPortfolio[r.h.portfolio_id] || 0) + r.currentValue;
+    if (!r.h.portfolio_id) continue;
+    if (r.currentValue) valueByPortfolio[r.h.portfolio_id] = (valueByPortfolio[r.h.portfolio_id] || 0) + r.currentValue;
+    if (r.costBasis) costByPortfolio[r.h.portfolio_id] = (costByPortfolio[r.h.portfolio_id] || 0) + r.costBasis;
   }
 
   // Portfolios (Day 15): "All portfolios" shows everything; a specific
@@ -310,7 +316,14 @@ async function loadHoldings() {
     if (wholeAccountValue > 0) {
       upserts.push(
         sb.from("portfolio_value_history").upsert(
-          { user_id: currentUserId, date: todayStr, total_value: wholeAccountValue, base_currency: BASE_CURRENCY, source: "live_update" },
+          {
+            user_id: currentUserId,
+            date: todayStr,
+            total_value: wholeAccountValue,
+            total_cost: wholeAccountCost || null,
+            base_currency: BASE_CURRENCY,
+            source: "live_update",
+          },
           { onConflict: "user_id,date" }
         )
       );
@@ -318,7 +331,15 @@ async function loadHoldings() {
     for (const [portfolioId, value] of Object.entries(valueByPortfolio)) {
       upserts.push(
         sb.from("portfolio_history").upsert(
-          { user_id: currentUserId, portfolio_id: portfolioId, date: todayStr, total_value: value, base_currency: BASE_CURRENCY, source: "live_update" },
+          {
+            user_id: currentUserId,
+            portfolio_id: portfolioId,
+            date: todayStr,
+            total_value: value,
+            total_cost: costByPortfolio[portfolioId] || null,
+            base_currency: BASE_CURRENCY,
+            source: "live_update",
+          },
           { onConflict: "portfolio_id,date" }
         )
       );
@@ -530,8 +551,8 @@ async function loadValueHistory() {
   heading.textContent = viewingAll ? "Portfolio Value Over Time" : `Portfolio Value Over Time — ${portfolioName || "…"}`;
 
   const query = viewingAll
-    ? sb.from("portfolio_value_history").select("date, total_value").order("date", { ascending: true })
-    : sb.from("portfolio_history").select("date, total_value").eq("portfolio_id", selectedPortfolioId).order("date", { ascending: true });
+    ? sb.from("portfolio_value_history").select("date, total_value, total_cost").order("date", { ascending: true })
+    : sb.from("portfolio_history").select("date, total_value, total_cost").eq("portfolio_id", selectedPortfolioId).order("date", { ascending: true });
 
   const { data, error } = await query;
 
@@ -629,8 +650,13 @@ function renderValueChart(svg, rawPoints) {
   const padY = 30;
 
   const values = points.map((p) => p.total_value);
-  const min = Math.min(...values);
-  const max = Math.max(...values);
+  // Day 22: the y-domain has to cover the cost-basis ("total buy-in") line
+  // too, not just market value — otherwise a portfolio deep in the red would
+  // clip its own buy-in line off the top of the chart.
+  const costValues = points.map((p) => p.total_cost).filter((v) => v != null);
+  const allValues = costValues.length ? values.concat(costValues) : values;
+  const min = Math.min(...allValues);
+  const max = Math.max(...allValues);
   const range = max - min || 1; // flat line (or single point): avoid divide-by-zero
 
   const xAt = (i) => (points.length === 1 ? width / 2 : padX + (i * (width - 2 * padX)) / (points.length - 1));
@@ -648,6 +674,16 @@ function renderValueChart(svg, rawPoints) {
   // right colors for whichever theme is active, light or dark, with no
   // JS re-render needed on theme toggle.
   const trendColor = trendUp ? "var(--green)" : "var(--red)";
+
+  // Cost-basis ("total buy-in") line: dashed, muted, no fill — a reference
+  // line rather than the headline series. Only draws through points that
+  // actually have a total_cost (older backfilled rows from before this
+  // column existed, or dates with no buy-date FX coverage yet, are left out
+  // rather than guessed — same philosophy as the price/FX carry-forward
+  // logic in history.js). In practice this is almost always every point.
+  const costIndices = points.map((p, i) => i).filter((i) => points[i].total_cost != null);
+  const costCoords = costIndices.map((i) => ({ x: xAt(i), y: yAt(points[i].total_cost) }));
+  const costPath = costCoords.length >= 2 ? smoothPath(costCoords) : "";
 
   // Dashed reference lines at 25/50/75% of the visible range, each labelled —
   // gives the eye something to measure against instead of just two numbers
@@ -676,6 +712,7 @@ function renderValueChart(svg, rawPoints) {
   svg.innerHTML = `
     ${gridLines}
     <path d="${areaPath}" style="fill:${trendColor};fill-opacity:0.12" stroke="none"></path>
+    ${costPath ? `<path d="${costPath}" fill="none" style="stroke:var(--muted)" stroke-width="1.75" stroke-dasharray="5,4" stroke-linecap="round" stroke-linejoin="round"></path>` : ""}
     <path d="${linePath}" fill="none" style="stroke:${trendColor}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"></path>
     <rect x="${(padX - 4).toFixed(1)}" y="4" width="${maxLabelWidth.toFixed(1)}" height="16" style="fill:var(--panel);fill-opacity:0.9" rx="3"></rect>
     <text x="${padX}" y="16" style="fill:var(--muted)" font-size="11">${maxLabel}</text>
@@ -718,7 +755,16 @@ function renderValueChart(svg, rawPoints) {
       tooltip.style.display = "block";
       tooltip.style.left = `${(c.x / width) * 100}%`;
       tooltip.style.top = `${(c.y / height) * 100}%`;
-      tooltip.textContent = `${new Date(p.date).toLocaleDateString()} · ${fmtMoney(p.total_value)}`;
+      // Day 22: second line shows the buy-in and the gap between it and
+      // market value (i.e. unrealised profit/loss) as of that specific date
+      // — only when this point actually has a cost-basis figure.
+      let html = `${new Date(p.date).toLocaleDateString()} · ${fmtMoney(p.total_value)}`;
+      if (p.total_cost != null) {
+        const profit = p.total_value - p.total_cost;
+        const profitColor = profit >= 0 ? "var(--green)" : "var(--red)";
+        html += `<br><span style="color:var(--muted)">Buy-in: ${fmtMoney(p.total_cost)}</span> <span style="color:${profitColor}">(${profit >= 0 ? "+" : ""}${fmtMoney(profit)})</span>`;
+      }
+      tooltip.innerHTML = html;
     }
   }
   function hideHover() {
