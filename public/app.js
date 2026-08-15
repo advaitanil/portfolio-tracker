@@ -106,6 +106,32 @@ function showModal({ type = "alert", title = "", message = "", placeholder = "",
   });
 }
 
+// Day 23 (a11y review, S-3.4 "Errors"): every <form> in the page now has
+// novalidate, so a required/type/minlength/etc. mismatch no longer triggers
+// the browser's own native validation bubble — which, in every browser we
+// checked, is icon/outline-only until you hover or focus it, isn't
+// consistently announced by screen readers, and (per the review) is exactly
+// what read as "small red icons inside each field with no text message."
+// This re-implements the SAME checks using the Constraint Validation API
+// (checkValidity()/validationMessage — still fully populated from the
+// required/type/minlength/pattern attributes already on each field, so
+// there's no duplicated validation logic to maintain) but renders the
+// message as real text in the form's existing error paragraph, which the
+// caller should mark aria-live="polite" so screen readers announce it.
+// Returns true if the form is valid (nothing to do), false if it stopped
+// submission and showed a message.
+function showValidationError(form, errEl) {
+  if (form.checkValidity()) return true;
+  const invalidEl = form.querySelector(":invalid");
+  if (invalidEl) {
+    errEl.textContent = invalidEl.validationMessage || "Please check the highlighted field.";
+    invalidEl.focus();
+  } else {
+    errEl.textContent = "Please check the form and try again.";
+  }
+  return false;
+}
+
 // Attaches the signed-in user's Supabase access token as a Bearer header.
 // The Worker now requires this on every route that costs API quota or
 // touches user data (Day 19: /refresh-prices, /run, /search-symbols,
@@ -288,9 +314,14 @@ async function loadHoldings() {
   gainEl.className = "value " + pctClass(totalGainAbs);
 
   const latestAsOf = Object.values(prices).map((p) => new Date(p.as_of)).sort((a, b) => b - a)[0];
+  // Day 23 (a11y/UX review, "no data-source attribution/freshness"): name
+  // the actual provider and the expected refresh cadence, not just a bare
+  // timestamp — so a stale-looking price reads as "expected lag" rather
+  // than "is this thing broken?". Individual rows also carry their own
+  // per-ticker "as of" in a hover title (see renderHoldingsTable).
   document.getElementById("asOfLabel").textContent = latestAsOf
-    ? `Prices as of: ${latestAsOf.toLocaleString()}`
-    : "Prices as of: no data yet — run the Worker or wait for the next schedule";
+    ? `Prices as of: ${latestAsOf.toLocaleString()} · Source: Twelve Data · stocks/ETFs refresh ~daily, funds ~every 3.5 days`
+    : "Prices as of: no data yet — run the Worker or wait for the next schedule · Source: Twelve Data";
   document.getElementById("baseCcyLabel").textContent = BASE_CURRENCY;
 
   renderAllocation(rows, totalValue);
@@ -427,31 +458,41 @@ function renderHoldingsTable() {
   const portfolioNameById = Object.fromEntries(allPortfolios.map((p) => [p.id, p.name]));
 
   tbody.innerHTML = rows
-    .map(({ h, currentValue, gainPct, dayChangePct, priceInBase, isStale, isFund }) => `
+    .map(({ h, currentValue, gainPct, dayChangePct, priceInBase, isStale, isFund, priceRow }) => {
+      // Day 23 (a11y/UX review, "no data-source attribution/freshness"): the
+      // "stale" flag alone doesn't say WHEN a price is from — this title
+      // gives the exact fetch timestamp per row on hover/focus, not just a
+      // single global "as of" figure in the header.
+      const asOfTitle = priceRow?.as_of
+        ? `Price as of ${new Date(priceRow.as_of).toLocaleString()} · Source: Twelve Data`
+        : "No price data yet";
+      return `
     <tr>
       <td>${h.ticker}</td>
       <td>${h.portfolio_id ? escapeHtml(portfolioNameById[h.portfolio_id] || "—") : '<span class="nav-tag">unassigned</span>'}</td>
       <td>${h.asset_type}</td>
       <td>${h.quantity}</td>
       <td>${fmtMoneyIn(h.buy_price, h.buy_currency)}</td>
-      <td>${priceInBase != null ? fmtMoney(priceInBase) : "—"}${isFund ? '<span class="nav-tag">NAV</span>' : ""}${isStale ? '<span class="stale">stale</span>' : ""}</td>
+      <td title="${escapeHtml(asOfTitle)}">${priceInBase != null ? fmtMoney(priceInBase) : "—"}${isFund ? '<span class="nav-tag">NAV</span>' : ""}${isStale ? '<span class="stale">stale</span>' : ""}</td>
       <td>${fmtMoney(currentValue)}</td>
       <td class="${pctClass(dayChangePct)}">${fmtPct(dayChangePct)}</td>
       <td class="${pctClass(gainPct)}">${fmtPct(gainPct)}</td>
       <td>${totalValue ? fmtPct((currentValue / totalValue) * 100).replace("+", "") : "—"}</td>
       <td>
-        <button class="sell-btn" data-id="${h.id}">Sell</button>
-        <button class="edit-btn" data-id="${h.id}">Edit</button>
-        <button class="del-btn" data-id="${h.id}">Delete</button>
+        <button class="sell-btn" data-id="${h.id}" aria-label="Sell ${escapeHtml(h.ticker)}">Sell</button>
+        <button class="edit-btn" data-id="${h.id}" aria-label="Edit ${escapeHtml(h.ticker)}">Edit</button>
+        <button class="del-btn" data-id="${h.id}" aria-label="Delete ${escapeHtml(h.ticker)}">Delete</button>
       </td>
-    </tr>`)
+    </tr>`;
+    })
     .join("");
 
   tbody.querySelectorAll(".del-btn").forEach((btn) =>
     btn.addEventListener("click", async () => {
+      const target = window.__holdingsById[btn.dataset.id];
       const ok = await showModal({
         type: "confirm",
-        title: "Delete holding?",
+        title: `Delete ${target?.ticker || "holding"}?`,
         message: 'This does NOT record a sale — use "Sell" instead if you actually disposed of it.',
         danger: true,
         confirmLabel: "Delete",
@@ -564,6 +605,9 @@ async function loadValueHistory() {
   }
   if (!data || data.length === 0) {
     svg.innerHTML = "";
+    svg.removeAttribute("aria-label");
+    const tableBody = document.getElementById("chartDataTableBody");
+    if (tableBody) tableBody.innerHTML = "";
     caption.textContent = viewingAll
       ? "No history yet — visit <WORKER_URL>/backfill-history once to seed it from real historical prices, or check back after a few scheduled runs."
       : "No history yet for this portfolio — it'll appear after your next edit/poll (live) or the next /backfill-history run (real historical prices).";
@@ -786,6 +830,34 @@ function renderValueChart(svg, rawPoints) {
     }
   };
   svg.ontouchend = hideHover;
+
+  // Accessible name (WCAG 1.1.1): the SVG has no alt text of its own, so a
+  // screen reader would otherwise announce nothing but "image". Summarize
+  // the trend in one sentence — same information a sighted user gets at a
+  // glance from the line's slope and colour.
+  const startVal = values[0];
+  const endVal = values[values.length - 1];
+  const changePct = startVal ? (((endVal - startVal) / Math.abs(startVal)) * 100).toFixed(1) : null;
+  const trendWord = trendUp ? "up" : "down";
+  const rangeDesc = points.length ? `from ${new Date(points[0].date).toLocaleDateString()} to ${new Date(points[points.length - 1].date).toLocaleDateString()}` : "";
+  svg.setAttribute(
+    "aria-label",
+    `Line chart of portfolio value ${rangeDesc}. Value ${trendWord} from ${fmtMoney(startVal)} to ${fmtMoney(endVal)}${changePct != null ? ` (${changePct >= 0 ? "+" : ""}${changePct}%)` : ""}. Full data is available in the table below the chart.`
+  );
+
+  // Text-table fallback (WCAG 1.1.1) — same points the SVG plots, as real
+  // DOM text a screen reader can read row by row instead of relying on the
+  // visual line shape.
+  const tableBody = document.getElementById("chartDataTableBody");
+  if (tableBody) {
+    tableBody.innerHTML = points
+      .map((p) => {
+        const dateStr = new Date(p.date).toLocaleDateString();
+        const costStr = p.total_cost != null ? fmtMoney(p.total_cost) : "—";
+        return `<tr><td>${dateStr}</td><td>${fmtMoney(p.total_value)}</td><td>${costStr}</td></tr>`;
+      })
+      .join("");
+  }
 }
 
 // Editing (Section 11 "Could": edit, not just delete) reuses the add-holding
@@ -855,6 +927,7 @@ document.getElementById("sellForm").addEventListener("submit", async (e) => {
   e.preventDefault();
   const errEl = document.getElementById("sellError");
   errEl.textContent = "";
+  if (!showValidationError(e.target, errEl)) return;
   if (!sellingHolding || !currentUserId) {
     errEl.textContent = "Nothing selected to sell.";
     return;
@@ -1382,6 +1455,7 @@ document.getElementById("holdingForm").addEventListener("submit", async (e) => {
   const statusEl = document.getElementById("formStatus");
   errEl.textContent = "";
   statusEl.textContent = "";
+  if (!showValidationError(e.target, errEl)) return;
   if (!currentUserId) {
     errEl.textContent = "Not signed in — please sign in again.";
     return;
@@ -1520,6 +1594,7 @@ let currentUserId = null; // set from whichever auth call succeeds — never re-
 function showApp(user) {
   currentUserId = user.id;
   document.getElementById("loginSection").style.display = "none";
+  document.getElementById("forgotPasswordSection").style.display = "none";
   document.getElementById("appContent").style.display = "";
   setDateToToday();
   loadPortfolios().then(loadHoldings);
@@ -1540,14 +1615,58 @@ function showLogin() {
   currentUserId = null;
   document.getElementById("appContent").style.display = "none";
   document.getElementById("resetPasswordSection").style.display = "none";
+  document.getElementById("forgotPasswordSection").style.display = "none";
   document.getElementById("loginSection").style.display = "";
+  // Always land back on "Sign in" mode, not whatever mode was left active.
+  const actionInput = document.getElementById("loginActionInput");
+  if (actionInput && actionInput.value !== "signin") {
+    document.getElementById("toggleSignupBtn").click();
+  }
 }
 
 function showResetPassword() {
   document.getElementById("appContent").style.display = "none";
   document.getElementById("loginSection").style.display = "none";
+  document.getElementById("forgotPasswordSection").style.display = "none";
   document.getElementById("resetPasswordSection").style.display = "";
 }
+
+// Day 23 (a11y/UX review): dedicated "forgot password" screen with its own
+// email field — see the HTML comment above #forgotPasswordSection for why
+// this replaced reusing the sign-in form's email input.
+function showForgotPassword() {
+  document.getElementById("appContent").style.display = "none";
+  document.getElementById("resetPasswordSection").style.display = "none";
+  document.getElementById("loginSection").style.display = "none";
+  document.getElementById("forgotPasswordSection").style.display = "";
+  document.getElementById("forgotPasswordError").textContent = "";
+  document.getElementById("forgotPasswordHint").textContent = "";
+  document.getElementById("forgotPasswordForm").reset();
+  document.querySelector('#forgotPasswordForm input[name="email"]').focus();
+}
+
+// Day 23 (a11y/UX review): toggles the sign-in form between "Sign in" and
+// "Sign up" modes. Replaces the old pair of adjacent, equally-weighted
+// submit buttons (easy to mis-click) with one primary button whose label
+// and hidden action value flip together, plus this lower-emphasis link.
+document.getElementById("toggleSignupBtn").addEventListener("click", () => {
+  const actionInput = document.getElementById("loginActionInput");
+  const submitBtn = document.getElementById("loginSubmitBtn");
+  const modeText = document.getElementById("loginModeText");
+  const toggleBtn = document.getElementById("toggleSignupBtn");
+  const passwordInput = document.querySelector('#loginForm input[name="password"]');
+  const errEl = document.getElementById("loginError");
+  const hintEl = document.getElementById("loginHint");
+  errEl.textContent = "";
+  hintEl.textContent = "";
+
+  const nowSignup = actionInput.value !== "signup";
+  actionInput.value = nowSignup ? "signup" : "signin";
+  submitBtn.textContent = nowSignup ? "Sign up" : "Sign in";
+  modeText.textContent = nowSignup ? "Already have an account?" : "New here?";
+  toggleBtn.textContent = nowSignup ? "Sign in" : "Create an account";
+  passwordInput.autocomplete = nowSignup ? "new-password" : "current-password";
+});
 
 document.getElementById("loginForm").addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -1555,11 +1674,12 @@ document.getElementById("loginForm").addEventListener("submit", async (e) => {
   const hintEl = document.getElementById("loginHint");
   errEl.textContent = "";
   hintEl.textContent = "";
+  if (!showValidationError(e.target, errEl)) return;
 
   const form = new FormData(e.target);
   const email = form.get("email");
   const password = form.get("password");
-  const action = e.submitter?.value || form.get("action"); // which button was clicked
+  const action = form.get("action"); // set by the Sign in/Sign up toggle link
 
   if (action === "signup") {
     const { data, error } = await sb.auth.signUp({ email, password });
@@ -1617,24 +1737,34 @@ document.getElementById("googleSignInBtn").addEventListener("click", async () =>
 // hash; the Supabase client auto-detects that on load and fires the
 // PASSWORD_RECOVERY event handled below, rather than this page parsing the
 // token itself.
-document.getElementById("forgotPasswordBtn").addEventListener("click", async () => {
-  const errEl = document.getElementById("loginError");
-  const hintEl = document.getElementById("loginHint");
+document.getElementById("forgotPasswordBtn").addEventListener("click", showForgotPassword);
+
+document.getElementById("cancelForgotPasswordBtn").addEventListener("click", showLogin);
+
+document.getElementById("forgotPasswordForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const errEl = document.getElementById("forgotPasswordError");
+  const hintEl = document.getElementById("forgotPasswordHint");
   errEl.textContent = "";
   hintEl.textContent = "";
-  const email = document.querySelector('#loginForm input[name="email"]').value.trim();
-  if (!email) {
-    errEl.textContent = 'Enter your email above first, then click "Forgot password?".';
-    return;
-  }
+  if (!showValidationError(e.target, errEl)) return;
+
+  const email = new FormData(e.target).get("email").trim();
   const { error } = await sb.auth.resetPasswordForEmail(email, {
     redirectTo: window.location.origin,
   });
+  // Day 23 (a11y/UX review): neutral confirmation copy regardless of whether
+  // the email matched an account. Supabase's resetPasswordForEmail doesn't
+  // error on an unknown address anyway (it wouldn't want to be an account-
+  // enumeration oracle either), but we phrase this defensively so the
+  // behaviour stays correct even if that ever changes — no message here
+  // should let someone infer whether a given email has an account.
   if (error) {
+    // Only network/rate-limit-type failures should reach here in practice.
     errEl.textContent = error.message;
     return;
   }
-  hintEl.textContent = `Password reset email sent to ${email} — check your inbox for the link.`;
+  hintEl.textContent = "If an account exists for that email, we've sent a link to reset your password. Check your inbox.";
 });
 
 document.getElementById("resetPasswordForm").addEventListener("submit", async (e) => {
@@ -1643,6 +1773,7 @@ document.getElementById("resetPasswordForm").addEventListener("submit", async (e
   const hintEl = document.getElementById("resetPasswordHint");
   errEl.textContent = "";
   hintEl.textContent = "";
+  if (!showValidationError(e.target, errEl)) return;
 
   const form = new FormData(e.target);
   const password = form.get("password");

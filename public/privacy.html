@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Privacy Policy — Portfolio Tracker</title>
+  <link rel="stylesheet" href="style.css" />
+  <script src="theme-init.js"></script>
+</head>
+<body>
+  <button type="button" id="themeToggleBtn" class="theme-toggle" aria-label="Switch theme" title="Switch light/dark theme">
+    <svg class="icon-sun" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="12" cy="12" r="4"></circle>
+      <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"></path>
+    </svg>
+    <svg class="icon-moon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+    </svg>
+  </button>
+
+  <main class="legal-page">
+    <p><a href="index.html">&larr; Back to Portfolio Tracker</a></p>
+    <h1>Privacy Policy</h1>
+    <p class="login-hint">Last updated: 15 August 2026</p>
+
+    <h2>What we collect</h2>
+    <p>Your account email, and whatever you choose to enter: portfolio names, holdings (ticker, quantity, buy price/date/currency), and sell records. If you sign in with Google, we receive the basic profile info Google shares for authentication (name, email).</p>
+
+    <h2>How it's used</h2>
+    <p>Solely to run the app for you: showing your holdings, computing valuations and gains, rendering your charts, and sending the daily performance email if that feature is enabled for your account. We don't use your data for advertising, and we don't sell it.</p>
+
+    <h2>Where it's stored</h2>
+    <p>Account data and holdings are stored in Supabase (Postgres), access-controlled so each account can only read its own data. The app runs on Cloudflare (Pages for the site, Workers for scheduled price updates and email). Market prices and FX rates come from Twelve Data and are cached server-side — this cache is shared infrastructure and doesn't contain your personal or holdings data.</p>
+
+    <h2>Third parties</h2>
+    <p>Sub-processors involved in running the app: Supabase (database & auth), Cloudflare (hosting & scheduled jobs), Twelve Data (market price/FX data), and Google (only if you use "Continue with Google"). None of them receive your holdings data except Supabase, which stores it on our behalf.</p>
+
+    <h2>Your choices</h2>
+    <p>This is an early-stage internal tool and self-serve account deletion/export isn't built yet. To request deletion or an export of your data in the meantime, contact the developer directly — see the Terms page.</p>
+
+    <h2>Security</h2>
+    <p>Connections are encrypted (HTTPS/TLS). Row Level Security is enforced at the database level so accounts can't read each other's data. See the Terms for the "as is," no-warranty basis this runs on.</p>
+
+    <h2>Changes</h2>
+    <p>This policy may be updated as the app evolves; the "last updated" date above will change accordingly.</p>
+  </main>
+
+  <script src="theme-toggle.js" defer></script>
+</body>
+</html>

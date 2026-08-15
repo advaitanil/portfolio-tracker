@@ -201,6 +201,70 @@ visit `<your-worker>/backfill-history` once to backfill real historical
 buy-in values; until then the buy-in line only starts from "today" onward
 (from live updates/the next scheduled run).
 
+### 3c. Security + accessibility review fixes (Day 23)
+
+An external Product/UX/Accessibility/Security review (`Portfolio_Tracker_Review.docx`)
+was done against the live site. All 9 **P0** findings from its action plan are
+fixed, front-end only — no schema or Worker changes, so a normal
+`git add -A && git commit && git push` is enough to ship this round (Cloudflare
+Pages redeploys automatically):
+
+- **RLS verified live (Critical, S-2).** Confirmed empirically, not just by
+  reading `pg_policies`: used an authenticated session's own access token to
+  query other real users' rows directly via the Supabase REST API. Zero
+  cross-tenant rows returned on any table. Server-side Row Level Security is
+  correctly enforced.
+- **Security response headers (High, S-3).** New `public/_headers` (Cloudflare
+  Pages headers file): CSP, HSTS, X-Frame-Options, X-Content-Type-Options,
+  Referrer-Policy, Permissions-Policy on every route.
+- **JWT-in-localStorage risk (High, S-1).** Mitigated via the same strict CSP
+  (`script-src 'self' https://cdn.jsdelivr.net`, no `unsafe-inline`/`unsafe-eval`)
+  — the real defence against the XSS that would be needed to steal the token.
+  Required moving the theme-detection script out of an inline `<head>` block
+  into `public/theme-init.js` so it stays same-origin.
+- **Unlabeled form fields (P0, a11y).** Every input/select across all forms
+  now has a real `aria-label` or `aria-labelledby`; table headers have
+  `scope="col"`; row action buttons are named per-ticker ("Sell VOO", not
+  just "Sell"); delete confirmations name the ticker in the dialog title.
+- **Icon/colour-only form errors (P0, a11y).** All 4 forms (sign-in, add/edit
+  holding, sell, reset password) now have `novalidate` + a shared
+  `showValidationError()` helper (`public/app.js`) that renders the browser's
+  own Constraint Validation API message as real, `aria-live="polite"` text
+  instead of relying on the native, often-unannounced validation bubble.
+- **Chart has no text alternative (P0, a11y).** The value-over-time SVG now
+  gets a dynamic `aria-label` summarising the trend (start/end value, %
+  change) plus `aria-describedby` pointing at the caption, and a
+  visually-hidden (`.sr-only`, not `display:none`) data table of the same
+  plotted points sits right below it in the DOM.
+- **Confusing password-reset flow (P0, UX).** "Forgot password?" now opens a
+  dedicated `#forgotPasswordSection` screen with its own email field, instead
+  of grabbing whatever was typed into the sign-in form. Confirmation copy is
+  neutral either way ("If an account exists for that email, we've sent a
+  link...") so the flow can't be used to enumerate registered emails.
+- **Unbranded sign-in, no trust cues (P0, UX/Trust).** Added a one-line value
+  prop above the form, and Terms/Privacy links at the bottom (new
+  `public/terms.html` / `public/privacy.html` — plain static pages, no new
+  backend). Also replaced the old adjacent, equal-weight "Sign in"/"Sign up"
+  button pair (flagged as an easy mis-click) with a single primary submit
+  button that toggles mode, plus a lower-emphasis text link below it.
+- **No data-source attribution/freshness (P0, Product/Trust).** The header's
+  "Prices as of" line now names the provider (Twelve Data) and the expected
+  refresh cadence. Each holdings-table row also carries its own exact
+  per-ticker "as of" timestamp in a hover/focus title, not just the one
+  global figure.
+
+New static files this round: `public/_headers`, `public/theme-init.js`,
+`public/theme-toggle.js` (theme toggle for `terms.html`/`privacy.html`, which
+don't load the full `app.js` bundle), `public/terms.html`, `public/privacy.html`.
+
+The remaining P1/P2 items from the review (enumeration/rate-limit hardening,
+price-vs-FX return attribution already partly done, duplicate-holding
+detection, account/data deletion + a published privacy policy commitment,
+transaction ledger, CSV import, benchmarks, and a full WCAG 2.2 AA pass on
+focus/motion/touch targets) are intentionally out of scope for this round —
+see the review doc's action-plan table for the full list and suggested
+owners/effort.
+
 ### 4. Worker
 
 ```
@@ -303,7 +367,7 @@ for more frequent news refreshes.
 
 ## Known limitations (honest list)
 
-- Multi-user with Supabase Auth + RLS (see "Login gate" note near the top) — every user's holdings/reports/history are scoped to `auth.uid() = user_id`, and as of Day 19 the Worker's HTTP endpoints check a real session token too, not just the database layer. Still an internal/small-scale tool, not hardened for public signup at scale.
+- Multi-user with Supabase Auth + RLS (see "Login gate" note near the top) — every user's holdings/reports/history are scoped to `auth.uid() = user_id`, and as of Day 19 the Worker's HTTP endpoints check a real session token too, not just the database layer. Cross-tenant isolation was verified live (Day 23) with direct REST API queries against real accounts, not just a policy read — zero rows leaked. Still an internal/small-scale tool, not hardened for public signup at scale (no rate limiting/CAPTCHA on auth endpoints yet).
 - FX conversion for cost basis: **fixed as of Day 19**, with a caveat. Unrealised gain, realized gain, and the daily email's gain figures now use the actual historical FX rate on each holding's buy_date/sell_date (see `ensureBuyDateFxCoverage` in `worker/src/index.js`), not just today's rate. The caveat: this depends on that historical rate having been backfilled/cached already — a currency/date combination that's never been seen before still falls back to today's rate until the next price refresh or daily run catches it up (usually within minutes of adding the holding, via `/refresh-prices`).
 - No retry/backoff tuning has been load-tested against real rate limits yet — the numbers in `retry.js` (3 attempts, exponential backoff) are reasonable defaults, not measured ones.
 - Metrics logic is duplicated between `public/app.js` (for the live dashboard) and `worker/src/lib/metrics.js` (for the email) rather than shared — acceptable for this scope, but a real product would extract one shared module.

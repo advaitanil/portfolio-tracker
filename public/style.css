@@ -35,6 +35,21 @@
   --shadow-sm: 0 2px 8px rgba(15, 23, 42, 0.08);
 }
 * { box-sizing: border-box; }
+
+/* Day 23 (a11y review): visually hides content while keeping it in the
+   accessibility tree — standard "sr-only" pattern, NOT display:none/
+   visibility:hidden (those remove it from assistive tech too). */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
 body {
   background: var(--bg);
   color: var(--text);
@@ -172,9 +187,18 @@ footer { margin-top: 40px; color: var(--muted); font-size: 0.75rem; border-top: 
   text-align: center;
 }
 .login-section form { flex-direction: column; align-items: stretch; }
-.login-actions { display: flex; gap: 8px; }
-.login-actions button[value="signup"] { background: transparent; border: 1px solid var(--accent); color: var(--accent); }
 .login-hint { color: var(--muted); font-size: 0.8rem; margin-top: 16px; }
+.login-value-prop { color: var(--muted); font-size: 0.88rem; margin: 4px 0 20px; line-height: 1.4; }
+.login-mode-toggle { color: var(--muted); font-size: 0.82rem; margin-top: 14px; }
+.login-mode-toggle .link-btn { padding: 0; margin-left: 4px; }
+.login-legal { color: var(--muted); font-size: 0.75rem; margin-top: 24px; line-height: 1.4; }
+.login-legal a { color: var(--muted); text-decoration: underline; }
+.login-legal a:hover { color: var(--accent); }
+
+.legal-page { max-width: 640px; margin: 0 auto; line-height: 1.6; }
+.legal-page h1 { margin-bottom: 4px; }
+.legal-page h2 { margin-top: 28px; font-size: 1.05rem; }
+.legal-page a { color: var(--accent); }
 
 .oauth-btn {
   width: 100%;

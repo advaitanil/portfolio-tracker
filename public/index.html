@@ -5,18 +5,14 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Portfolio Tracker</title>
   <link rel="stylesheet" href="style.css" />
-  <!-- Set the theme attribute BEFORE the page paints (inline, blocking, in
-       <head>) so there's no flash of the wrong theme on load — by the time
-       app.js runs at the bottom of <body>, the browser has already rendered
-       once. Falls back to the OS-level light/dark preference the first time,
-       then remembers whatever the user picks via the toggle. -->
-  <script>
-    (function () {
-      var saved = localStorage.getItem("theme");
-      var wantsLight = saved ? saved === "light" : window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches;
-      if (wantsLight) document.documentElement.setAttribute("data-theme", "light");
-    })();
-  </script>
+  <!-- Set the theme attribute BEFORE the page paints (blocking, in <head>)
+       so there's no flash of the wrong theme on load — by the time app.js
+       runs at the bottom of <body>, the browser has already rendered once.
+       Falls back to the OS-level light/dark preference the first time, then
+       remembers whatever the user picks via the toggle. Moved to an external
+       file (Day 23) so the CSP's script-src can drop 'unsafe-inline' — see
+       theme-init.js. -->
+  <script src="theme-init.js"></script>
 </head>
 <body>
   <!-- Always-visible theme toggle — sits outside the login/app sections so
@@ -31,11 +27,22 @@
     </svg>
   </button>
 
+  <!-- Day 23 (a11y review, "no <main> landmark"): everything that counts as
+       this page's actual content — whichever of the login gate, the
+       password-reset screen, or the dashboard happens to be visible — lives
+       inside one <main>. The theme toggle and modal overlay are page chrome,
+       not content, so they stay outside it. -->
+  <main>
+
   <!-- Login gate: this project's brief (Section 2) explicitly says "single
        portfolio, no login, keep it simple" — this gate is an intentional
        deviation from that, added on request. See README for the note. -->
   <section class="login-section" id="loginSection">
     <h1>Portfolio Tracker</h1>
+    <!-- Day 23 (a11y/UX review, finding "Onboarding & trust friction"):
+         a one-line value prop so the sign-in screen explains itself before
+         asking for credentials, rather than being a bare, unbranded form. -->
+    <p class="login-value-prop">Track your stocks, ETFs, and funds in one place — with a daily performance email.</p>
     <button type="button" id="googleSignInBtn" class="oauth-btn">
       <svg viewBox="0 0 18 18" width="18" height="18" aria-hidden="true">
         <path fill="#4285F4" d="M17.64 9.2c0-.64-.06-1.25-.16-1.84H9v3.48h4.84a4.14 4.14 0 0 1-1.8 2.72v2.26h2.9c1.7-1.57 2.7-3.88 2.7-6.62z"/>
@@ -46,30 +53,59 @@
       Continue with Google
     </button>
     <div class="login-divider"><span>or</span></div>
-    <form id="loginForm">
-      <input name="email" type="email" placeholder="Email" required autocomplete="username" />
-      <input name="password" type="password" placeholder="Password" required autocomplete="current-password" minlength="6" />
-      <div class="login-actions">
-        <button type="submit" name="action" value="signin">Sign in</button>
-        <button type="submit" name="action" value="signup">Sign up</button>
-      </div>
+    <!-- Day 23: previously two equal-weight, adjacent "Sign in"/"Sign up"
+         buttons sharing the same fields — the review flagged this as an
+         easy mis-click. Now there's a single primary submit button whose
+         label/action flips between the two modes, plus a lower-emphasis
+         toggle link below (matching how "Forgot password?" is styled) —
+         only one prominent, unambiguous action is on screen at a time. -->
+    <form id="loginForm" novalidate>
+      <input name="email" type="email" placeholder="Email" aria-label="Email" required autocomplete="username" />
+      <input name="password" type="password" placeholder="Password" aria-label="Password" required autocomplete="current-password" minlength="6" />
+      <input type="hidden" name="action" id="loginActionInput" value="signin" />
+      <button type="submit" id="loginSubmitBtn">Sign in</button>
     </form>
+    <p class="login-mode-toggle">
+      <span id="loginModeText">New here?</span>
+      <button type="button" id="toggleSignupBtn" class="link-btn">Create an account</button>
+    </p>
     <button type="button" id="forgotPasswordBtn" class="link-btn">Forgot password?</button>
-    <p class="form-error" id="loginError"></p>
+    <p class="form-error" id="loginError" aria-live="polite"></p>
     <p class="login-hint" id="loginHint"></p>
+    <!-- Trust cues (Day 23): terms/privacy links before any credentials are
+         entered, per the review's "no terms/privacy links" finding. -->
+    <p class="login-legal">By continuing, you agree to the <a href="terms.html" target="_blank" rel="noopener">Terms</a> and <a href="privacy.html" target="_blank" rel="noopener">Privacy Policy</a>.</p>
+  </section>
+
+  <!-- Day 23 (a11y/UX review): a dedicated screen with its own email field,
+       rather than reusing the sign-in form's email input — the review
+       flagged the old "click Forgot password, it grabs whatever's typed in
+       the sign-in box" behaviour as confusing (e.g. if that box was empty,
+       mid-edit, or the user actually wanted to reset a different account's
+       password than the one currently typed in). -->
+  <section class="login-section" id="forgotPasswordSection" style="display: none">
+    <h1>Reset your password</h1>
+    <p class="login-hint">Enter your account email and we'll send you a link to set a new password.</p>
+    <form id="forgotPasswordForm" novalidate>
+      <input name="email" type="email" placeholder="Email" aria-label="Email" required autocomplete="username" />
+      <button type="submit">Send reset link</button>
+    </form>
+    <button type="button" id="cancelForgotPasswordBtn" class="link-btn">Back to sign in</button>
+    <p class="form-error" id="forgotPasswordError" aria-live="polite"></p>
+    <p class="login-hint" id="forgotPasswordHint" aria-live="polite"></p>
   </section>
 
   <!-- Shown only when the user arrives via a Supabase password-reset email
        link (detected through the PASSWORD_RECOVERY auth event in app.js). -->
   <section class="login-section" id="resetPasswordSection" style="display: none">
     <h1>Set a new password</h1>
-    <form id="resetPasswordForm">
-      <input name="password" type="password" placeholder="New password" required autocomplete="new-password" minlength="6" />
-      <input name="confirmPassword" type="password" placeholder="Confirm new password" required autocomplete="new-password" minlength="6" />
+    <form id="resetPasswordForm" novalidate>
+      <input name="password" type="password" placeholder="New password" aria-label="New password" required autocomplete="new-password" minlength="6" />
+      <input name="confirmPassword" type="password" placeholder="Confirm new password" aria-label="Confirm new password" required autocomplete="new-password" minlength="6" />
       <button type="submit">Update password</button>
     </form>
     <button type="button" id="cancelResetBtn" class="link-btn">Back to sign in</button>
-    <p class="form-error" id="resetPasswordError"></p>
+    <p class="form-error" id="resetPasswordError" aria-live="polite"></p>
     <p class="login-hint" id="resetPasswordHint"></p>
   </section>
 
@@ -125,7 +161,7 @@
         <button type="button" data-range="all" class="active">All</button>
       </div>
       <div class="chart-wrap">
-        <svg id="valueChart" viewBox="0 0 700 260" preserveAspectRatio="none"></svg>
+        <svg id="valueChart" viewBox="0 0 700 260" preserveAspectRatio="none" role="img" aria-labelledby="chartHeading" aria-describedby="chartCaption"></svg>
         <div class="chart-tooltip" id="chartTooltip" style="display: none"></div>
       </div>
       <div class="chart-legend">
@@ -133,6 +169,23 @@
         <span class="chart-legend-item"><span class="chart-legend-swatch swatch-cost"></span>Total buy-in (cost basis)</span>
       </div>
       <p class="chart-caption" id="chartCaption">No history yet — run a backfill or check back after a few scheduled runs.</p>
+      <!-- Accessible fallback for the hand-drawn SVG chart above (WCAG 1.1.1):
+           the SVG conveys the same trend visually, but screen reader users
+           get no equivalent unless the underlying data is exposed as real
+           text. Kept in the DOM (not display:none) so it's still announced,
+           just visually hidden via the .sr-only clip technique. Populated by
+           renderValueChart() in app.js from the same point data as the SVG. -->
+      <table class="sr-only" id="chartDataTable">
+        <caption>Data table for the portfolio value chart above</caption>
+        <thead>
+          <tr>
+            <th scope="col">Date</th>
+            <th scope="col">Market value</th>
+            <th scope="col">Total buy-in</th>
+          </tr>
+        </thead>
+        <tbody id="chartDataTableBody"></tbody>
+      </table>
     </section>
 
     <section class="allocation" id="allocationSection">
@@ -151,44 +204,44 @@
 
     <section class="add-holding">
       <h2 id="holdingFormTitle">Add a holding</h2>
-      <form id="holdingForm">
+      <form id="holdingForm" novalidate>
         <div class="ticker-search-wrap">
-          <input name="ticker" id="tickerInput" placeholder="Ticker (e.g. AAPL)" required maxlength="10" autocomplete="off" />
+          <input name="ticker" id="tickerInput" placeholder="Ticker (e.g. AAPL)" aria-label="Ticker symbol" required maxlength="10" autocomplete="off" />
           <ul id="tickerSuggestions" class="ticker-suggestions" style="display: none"></ul>
         </div>
-        <select name="portfolio_id" id="portfolioFormSelect"></select>
-        <select name="asset_type" required>
+        <select name="portfolio_id" id="portfolioFormSelect" aria-label="Portfolio"></select>
+        <select name="asset_type" aria-label="Asset type" required>
           <option value="stock">Stock</option>
           <option value="etf">ETF</option>
           <option value="fund">Fund</option>
         </select>
-        <input name="quantity" type="number" step="any" min="0.000001" placeholder="Quantity" required />
-        <input name="buy_price" type="number" step="any" min="0.000001" placeholder="Buy price" required />
-        <select name="buy_currency" required>
+        <input name="quantity" type="number" step="any" min="0.000001" placeholder="Quantity" aria-label="Quantity" required />
+        <input name="buy_price" type="number" step="any" min="0.000001" placeholder="Buy price" aria-label="Buy price" required />
+        <select name="buy_currency" aria-label="Buy currency" required>
           <option value="USD">USD</option>
           <option value="EUR">EUR</option>
           <option value="GBP">GBP</option>
           <option value="JPY">JPY</option>
           <option value="INR">INR</option>
         </select>
-        <input name="buy_date" type="date" id="buyDateInput" required />
+        <input name="buy_date" type="date" id="buyDateInput" aria-label="Buy date" required />
         <button type="submit" id="formSubmitBtn">Add holding</button>
         <button type="button" id="cancelEditBtn" style="display: none">Cancel edit</button>
       </form>
-      <p class="form-error" id="formError"></p>
+      <p class="form-error" id="formError" aria-live="polite"></p>
       <p class="form-status" id="formStatus"></p>
     </section>
 
     <section class="holdings">
       <h2>Holdings <button type="button" id="exportHoldingsBtn" class="export-btn">Export CSV</button></h2>
-      <input type="text" id="holdingsSearch" class="holdings-search" placeholder="Search by ticker…" autocomplete="off" />
+      <input type="text" id="holdingsSearch" class="holdings-search" placeholder="Search by ticker…" aria-label="Search holdings by ticker" autocomplete="off" />
       <table id="holdingsTable">
         <thead>
           <tr>
-            <th data-sort="ticker">Ticker</th><th data-sort="portfolio">Portfolio</th><th data-sort="type">Type</th>
-            <th data-sort="qty">Qty</th><th data-sort="buyPrice">Buy Price</th><th data-sort="price">Current Price</th>
-            <th data-sort="value">Value</th><th data-sort="day">Day %</th><th data-sort="gain">Gain/Loss %</th>
-            <th data-sort="weight">Weight</th><th></th>
+            <th scope="col" data-sort="ticker">Ticker</th><th scope="col" data-sort="portfolio">Portfolio</th><th scope="col" data-sort="type">Type</th>
+            <th scope="col" data-sort="qty">Qty</th><th scope="col" data-sort="buyPrice">Buy Price</th><th scope="col" data-sort="price">Current Price</th>
+            <th scope="col" data-sort="value">Value</th><th scope="col" data-sort="day">Day %</th><th scope="col" data-sort="gain">Gain/Loss %</th>
+            <th scope="col" data-sort="weight">Weight</th><th scope="col"><span class="sr-only">Actions</span></th>
           </tr>
         </thead>
         <tbody id="holdingsBody">
@@ -199,28 +252,28 @@
 
     <section class="sell-holding" id="sellSection" style="display: none">
       <h2>Sell <span id="sellTicker"></span></h2>
-      <form id="sellForm">
-        <input name="sell_quantity" id="sellQuantityInput" type="number" step="any" min="0.000001" placeholder="Quantity to sell" required />
-        <input name="sell_price" type="number" step="any" min="0.000001" placeholder="Sell price" required />
-        <select name="sell_currency" id="sellCurrencySelect" required>
+      <form id="sellForm" novalidate>
+        <input name="sell_quantity" id="sellQuantityInput" type="number" step="any" min="0.000001" placeholder="Quantity to sell" aria-label="Quantity to sell" required />
+        <input name="sell_price" type="number" step="any" min="0.000001" placeholder="Sell price" aria-label="Sell price" required />
+        <select name="sell_currency" id="sellCurrencySelect" aria-label="Sell currency" required>
           <option value="USD">USD</option>
           <option value="EUR">EUR</option>
           <option value="GBP">GBP</option>
           <option value="JPY">JPY</option>
           <option value="INR">INR</option>
         </select>
-        <input name="sell_date" type="date" id="sellDateInput" required />
+        <input name="sell_date" type="date" id="sellDateInput" aria-label="Sell date" required />
         <button type="submit">Record sale</button>
         <button type="button" id="cancelSellBtn">Cancel</button>
       </form>
-      <p class="form-error" id="sellError"></p>
+      <p class="form-error" id="sellError" aria-live="polite"></p>
     </section>
 
     <section class="realized-gains">
       <h2>Realized Gains <button type="button" id="exportRealizedGainsBtn" class="export-btn">Export CSV</button></h2>
       <table>
         <thead>
-          <tr><th>Ticker</th><th>Qty</th><th>Buy Price</th><th>Sell Price</th><th>Sell Date</th><th>Gain/Loss</th></tr>
+          <tr><th scope="col">Ticker</th><th scope="col">Qty</th><th scope="col">Buy Price</th><th scope="col">Sell Price</th><th scope="col">Sell Date</th><th scope="col">Gain/Loss</th></tr>
         </thead>
         <tbody id="realizedGainsBody">
           <tr><td colspan="6">Loading…</td></tr>
@@ -234,6 +287,8 @@
     </footer>
   </div>
 
+  </main>
+
   <!-- In-app modal: styled replacement for prompt()/confirm()/alert() so
        portfolio create/rename/delete and holding-delete confirmations match
        the rest of the dashboard instead of popping a native browser dialog.
@@ -243,7 +298,7 @@
     <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
       <h3 id="modalTitle"></h3>
       <p id="modalMessage"></p>
-      <input type="text" id="modalInput" style="display: none" />
+      <input type="text" id="modalInput" aria-labelledby="modalTitle" style="display: none" />
       <div class="modal-actions">
         <button type="button" id="modalCancelBtn">Cancel</button>
         <button type="button" id="modalConfirmBtn">OK</button>

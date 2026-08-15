@@ -1,0 +1,29 @@
+# Security response headers (Day 23 security review, finding S-3: "No
+# security response headers"). Cloudflare Pages reads this file from the
+# deployed output directory and applies the rules automatically — no extra
+# config or redeploy step beyond a normal `git push`.
+# Reference: https://developers.cloudflare.com/pages/configuration/headers/
+#
+# CSP notes (also covers S-1, JWT-in-localStorage — a strict CSP is the
+# main defence against the XSS that would be needed to steal it):
+#   - script-src has NO 'unsafe-inline'/'unsafe-eval'. The one script that
+#     used to be inline (the theme flash-prevention snippet) was moved to
+#     theme-init.js (same-origin, so 'self' covers it) specifically so this
+#     could stay strict.
+#   - style-src DOES allow 'unsafe-inline'. The value-over-time chart is a
+#     hand-built SVG string with per-element style="..." attributes (so the
+#     colors can use CSS custom properties and repaint on theme toggle) —
+#     removing this would break the chart's styling. This is a deliberate,
+#     narrower trade-off: inline CSS is a much weaker injection vector than
+#     inline JS (no arbitrary code execution), and script-src is where the
+#     real protection lives.
+#   - connect-src is scoped to exactly the two origins the app ever calls:
+#     Supabase (DB/auth) and the Cloudflare Worker (price refresh/run-now/
+#     ticker search). Nothing else should ever be reachable from page JS.
+/*
+  Content-Security-Policy: default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self' https://awnlpgsbgswhohttniso.supabase.co https://portfolio-tracker-worker.rexorot64.workers.dev; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'; upgrade-insecure-requests
+  Strict-Transport-Security: max-age=15552000; includeSubDomains; preload
+  X-Frame-Options: DENY
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+  Permissions-Policy: geolocation=(), camera=(), microphone=(), payment=(), usb=()
