@@ -136,8 +136,50 @@ export default {
       const result = await searchSymbols(q, env);
       return Response.json(result, { headers: CORS_HEADERS });
     }
+    if (url.pathname === "/find-user-by-email") {
+      // Day 26 ("view-only sharing"): the front end can't resolve an invite
+      // email to a Supabase Auth user id itself — the anon key has no access
+      // to auth.users, and portfolio_shares.shared_with_user_id needs a real
+      // uuid, not an email string. Any signed-in user can call this (it only
+      // confirms whether an email you already typed in has an account here,
+      // the same trust level as e.g. a "forgot password" flow), but it never
+      // returns anything beyond {id, email} — no other account details.
+      const authedUser = await getAuthedUser(req, env);
+      if (!authedUser) return Response.json({ error: "unauthorized" }, { status: 401, headers: CORS_HEADERS });
+      const email = (url.searchParams.get("email") || "").trim();
+      if (!email) return Response.json({ error: "pass ?email=..." }, { status: 400, headers: CORS_HEADERS });
+      try {
+        const sb = makeSupabase(env);
+        const user = await sb.getUserByEmail(email);
+        if (!user) return Response.json({ found: false }, { headers: CORS_HEADERS });
+        return Response.json({ found: true, id: user.id, email: user.email }, { headers: CORS_HEADERS });
+      } catch (err) {
+        return Response.json({ error: err.message }, { status: 500, headers: CORS_HEADERS });
+      }
+    }
+    if (url.pathname === "/benchmark-history") {
+      // Day 26 ("Benchmark overlay"): proxies Twelve Data's historical
+      // time_series for a single ticker (same helper the chart backfill
+      // uses), so the API key never has to live in the browser and the
+      // front end doesn't need its own market-data credentials just to draw
+      // a comparison line.
+      const authedUser = await getAuthedUser(req, env);
+      if (!authedUser) return Response.json({ error: "unauthorized" }, { status: 401, headers: CORS_HEADERS });
+      const ticker = (url.searchParams.get("ticker") || "").trim().toUpperCase();
+      const since = url.searchParams.get("since") || "";
+      if (!ticker || !/^\d{4}-\d{2}-\d{2}$/.test(since)) {
+        return Response.json({ error: "pass ?ticker=SPY&since=YYYY-MM-DD" }, { status: 400, headers: CORS_HEADERS });
+      }
+      try {
+        const result = await fetchHistoricalPrices([ticker], since, env);
+        const entry = result[ticker] || { currency: null, series: {} };
+        return Response.json({ ticker, currency: entry.currency, series: entry.series }, { headers: CORS_HEADERS });
+      } catch (err) {
+        return Response.json({ error: err.message }, { status: 500, headers: CORS_HEADERS });
+      }
+    }
     return new Response(
-      "Portfolio Tracker Worker. Try /run, /run?user_id=..., /status?user_id=..., /refresh-prices, /backfill-history, /search-symbols?q=..., or POST /delete-account",
+      "Portfolio Tracker Worker. Try /run, /run?user_id=..., /status?user_id=..., /refresh-prices, /backfill-history, /search-symbols?q=..., /find-user-by-email?email=..., /benchmark-history?ticker=...&since=..., or POST /delete-account",
       { status: 200 }
     );
   },
@@ -458,13 +500,21 @@ async function runDailyJob(env) {
     // --- Shared price/FX refresh, once for the union of every user's tickers ---
     const { priceResults, fxRatesToday, fxRatesYesterday } = await refreshSharedPriceFxCache(env, sb, allHoldings, baseCurrency);
 
+    // Day 26 ("Price alerts") — fetched once for everyone, same shared-fetch
+    // pattern as holdings/prices above, then filtered per user below.
+    const activeAlerts = await sb.getActivePriceAlerts().catch((e) => {
+      console.error("Failed to load active price alerts (continuing without alert checks):", e.message);
+      return [];
+    });
+
     // --- Per-user: metrics, news, commentary, email, logging ---
     const results = [];
     for (const user of users) {
       const holdings = allHoldings.filter((h) => h.user_id === user.id);
       if (!holdings.length) continue; // signed up, no holdings yet — nothing to email
 
-      const result = await processUserDailyJob({ user, holdings, priceResults, fxRatesToday, fxRatesYesterday, baseCurrency, sb, env });
+      const userAlerts = activeAlerts.filter((a) => a.user_id === user.id);
+      const result = await processUserDailyJob({ user, holdings, priceResults, fxRatesToday, fxRatesYesterday, baseCurrency, sb, env, userAlerts });
       results.push(result);
     }
 
@@ -497,7 +547,12 @@ async function runDailyJobForUser(env, userId) {
     if (!user) return { status: "failed", error: "no user found for that id" };
 
     const { priceResults, fxRatesToday, fxRatesYesterday } = await refreshSharedPriceFxCache(env, sb, holdings, baseCurrency);
-    const result = await processUserDailyJob({ user, holdings, priceResults, fxRatesToday, fxRatesYesterday, baseCurrency, sb, env });
+    const allAlerts = await sb.getActivePriceAlerts().catch((e) => {
+      console.error("Failed to load active price alerts (continuing without alert checks):", e.message);
+      return [];
+    });
+    const userAlerts = allAlerts.filter((a) => a.user_id === userId);
+    const result = await processUserDailyJob({ user, holdings, priceResults, fxRatesToday, fxRatesYesterday, baseCurrency, sb, env, userAlerts });
 
     return { status: "completed", duration_ms: Date.now() - startedAt, user: result };
   } catch (err) {
@@ -510,15 +565,34 @@ async function runDailyJobForUser(env, userId) {
 // email (sent to THEIR OWN address, looked up from their Supabase Auth
 // account — not a fixed EMAIL_TO), and their own daily_reports/history rows.
 // Wrapped so one user's failure can't take down anyone else's run.
-async function processUserDailyJob({ user, holdings, priceResults, fxRatesToday, fxRatesYesterday, baseCurrency, sb, env }) {
+async function processUserDailyJob({ user, holdings, priceResults, fxRatesToday, fxRatesYesterday, baseCurrency, sb, env, userAlerts = [] }) {
   const startedAt = Date.now();
   let status = "sent";
   let errorMsg = null;
   let metrics = null;
   let commentary = null;
   let topNews = [];
+  let triggeredAlerts = [];
 
   try {
+    // Day 26 ("Price alerts") — checked against this run's freshly-fetched
+    // native-currency price (priceResults[ticker].price), same price the
+    // rest of this function converts to base currency below. One-shot: a
+    // fired alert flips to active=false immediately so it won't re-fire
+    // tomorrow just because the price is still past the threshold — the
+    // user re-arms it (or sets a new one) from the dashboard if they want
+    // another alert at a different level.
+    for (const alert of userAlerts) {
+      const price = priceResults[alert.ticker]?.price;
+      if (price == null) continue;
+      const fired = alert.condition === "above" ? price >= alert.target_price : price <= alert.target_price;
+      if (!fired) continue;
+      triggeredAlerts.push({ ...alert, triggered_price: price });
+      await sb
+        .updateRow("price_alerts", alert.id, { active: false, triggered_at: new Date().toISOString(), triggered_price: price })
+        .catch((e) => console.error(`[${user.email}] Failed to mark alert ${alert.id} triggered (continuing anyway):`, e.message));
+    }
+
     // Day 19: look up each holding's OWN buy-date FX rate (cached by
     // ensureBuyDateFxCoverage, called earlier in refreshSharedPriceFxCache)
     // instead of letting cost basis silently use today's rate. Missing
@@ -602,7 +676,7 @@ async function processUserDailyJob({ user, holdings, priceResults, fxRatesToday,
     // AI commentary (Day 10) — never let it block the email either.
     commentary = await writeCommentary(metrics, topNews, env).catch(() => null);
 
-    const html = renderEmail(metrics, topNews, commentary);
+    const html = renderEmail(metrics, topNews, commentary, triggeredAlerts);
     const subject = buildSubject(metrics);
     await sendEmail(html, subject, { ...env, EMAIL_TO: user.email }); // each user gets their own email
   } catch (err) {

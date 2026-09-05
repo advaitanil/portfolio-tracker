@@ -19,6 +19,15 @@ create table if not exists holdings (
   -- back to null rather than cascading — you lose the grouping, never the
   -- holding itself.
   portfolio_id uuid references portfolios (id) on delete set null,
+  -- Day 26 ("Position notes") — freeform, private annotation on the
+  -- holding ("core position, don't touch", "cost-averaging in", etc).
+  -- IMPORTANT: RLS is row-level, not column-level — the "shared viewers can
+  -- read shared holdings" policy below grants a viewer the WHOLE row,
+  -- notes included, if they query for it. The app's own shared-view query
+  -- (app.js loadSharedHoldings) deliberately requests a column list that
+  -- excludes notes, but that's an app-layer convention, not a database
+  -- guarantee — documented in README's Known Limitations, not solved here.
+  notes        text,
   created_at   timestamptz not null default now()
 );
 create index if not exists idx_holdings_user on holdings (user_id);
@@ -206,6 +215,112 @@ create table if not exists transactions (
 create index if not exists idx_transactions_user_date on transactions (user_id, event_date desc);
 create index if not exists idx_transactions_user_ticker on transactions (user_id, ticker);
 
+-- ── price_alerts ────────────────────────────────────────────────────────────
+-- Day 26 ("Price alerts"). One row per threshold a user wants watched. Checked
+-- once per scheduled Worker run (see worker/src/index.js processUserDailyJob)
+-- against that run's freshly-fetched price for `ticker` — NOT continuously,
+-- so the soonest an alert can fire is the next daily run (or the next manual
+-- "Run now"). `active` flips to false the moment it fires (one-shot, not a
+-- standing threshold that re-fires every day the price stays past it);
+-- `triggered_at`/`triggered_price` record what actually fired it.
+create table if not exists price_alerts (
+  id              uuid primary key default gen_random_uuid(),
+  user_id         uuid not null references auth.users (id) on delete cascade,
+  ticker          text not null,
+  condition       text not null check (condition in ('above', 'below')),
+  target_price    numeric not null check (target_price > 0),
+  active          boolean not null default true,
+  triggered_at    timestamptz,
+  triggered_price numeric,
+  created_at      timestamptz not null default now()
+);
+create index if not exists idx_price_alerts_user on price_alerts (user_id);
+create index if not exists idx_price_alerts_active_ticker on price_alerts (ticker) where active;
+
+-- ── watchlist ───────────────────────────────────────────────────────────────
+-- Day 26 ("Watchlist"). Tickers a user wants to track the price of without
+-- actually owning them — deliberately separate from `holdings` (which always
+-- implies quantity/cost basis/gain math) rather than a "quantity 0" holding
+-- hack. The front end fetches these tickers' prices the same way it does for
+-- holdings (shared `prices` cache), it just never contributes to portfolio
+-- value/allocation.
+create table if not exists watchlist (
+  id         uuid primary key default gen_random_uuid(),
+  user_id    uuid not null references auth.users (id) on delete cascade,
+  ticker     text not null,
+  notes      text,
+  created_at timestamptz not null default now()
+);
+create index if not exists idx_watchlist_user on watchlist (user_id);
+create unique index if not exists idx_watchlist_user_ticker on watchlist (user_id, ticker);
+
+-- ── dividends ───────────────────────────────────────────────────────────────
+-- Day 26 ("Dividend log"). Manual entry, since neither Twelve Data's free
+-- tier nor this app's brief includes a dividends feed — a user types in what
+-- they actually received. holding_id is nullable and NOT cascaded to a
+-- specific lot's lifecycle the way transactions.holding_id is documented:
+-- a dividend is a cash event tied to having owned a ticker on its pay date,
+-- and should stay on the books even if that holding is later sold/deleted.
+create table if not exists dividends (
+  id         uuid primary key default gen_random_uuid(),
+  user_id    uuid not null references auth.users (id) on delete cascade,
+  ticker     text not null,
+  amount     numeric not null check (amount > 0),
+  currency   text not null default 'USD',
+  pay_date   date not null,
+  notes      text,
+  created_at timestamptz not null default now()
+);
+create index if not exists idx_dividends_user_date on dividends (user_id, pay_date desc);
+
+-- ── target_allocations ──────────────────────────────────────────────────────
+-- Day 26 ("Target allocation + rebalancing hints"). A user-set target weight,
+-- either per asset_type ('stock'/'etf'/'fund') or per specific ticker —
+-- key_type says which, key_value holds the actual asset_type/ticker string.
+-- Intentionally NOT enforced to sum to 100% at the database level (a partial
+-- set of targets, e.g. just "stocks: 60%", is still useful for a rebalancing
+-- hint on that one line) — the front end explains the gap when targets don't
+-- cover the whole portfolio.
+create table if not exists target_allocations (
+  id         uuid primary key default gen_random_uuid(),
+  user_id    uuid not null references auth.users (id) on delete cascade,
+  key_type   text not null check (key_type in ('asset_type', 'ticker')),
+  key_value  text not null,
+  target_pct numeric not null check (target_pct >= 0 and target_pct <= 100),
+  created_at timestamptz not null default now()
+);
+create index if not exists idx_target_allocations_user on target_allocations (user_id);
+create unique index if not exists idx_target_allocations_user_key on target_allocations (user_id, key_type, key_value);
+
+-- ── portfolio_shares ────────────────────────────────────────────────────────
+-- Day 26 ("Multi-account/household view — view-only sharing"). Lets a user
+-- (owner_user_id) grant another signed-up user (shared_with_user_id) read-only
+-- visibility into their holdings/portfolios/value history. portfolio_id
+-- nullable = shared access to ALL of the owner's portfolios (including
+-- unassigned holdings); a specific portfolio_id scopes it to just that one.
+-- This is deliberately READ-only and narrow: it grants no ability to add,
+-- edit, sell, or delete anything, and does NOT extend to notes, dividends,
+-- transactions, watchlist, or price alerts — see the RLS SELECT-only
+-- policies below, which are additive to (not a replacement for) each table's
+-- existing "owner does everything" policy.
+create table if not exists portfolio_shares (
+  id                  uuid primary key default gen_random_uuid(),
+  owner_user_id       uuid not null references auth.users (id) on delete cascade,
+  shared_with_user_id uuid not null references auth.users (id) on delete cascade,
+  -- Snapshots of both emails at share-creation time, so BOTH sides' lists
+  -- ("who I've shared with" / "who's shared with me") read sensibly even if
+  -- either account's email later changes — and so the recipient's "Shared
+  -- with you" list can show who the owner is without needing its own lookup
+  -- (the recipient's anon-key session has no access to auth.users either).
+  shared_with_email   text not null,
+  owner_email         text not null,
+  portfolio_id        uuid references portfolios (id) on delete cascade,
+  created_at          timestamptz not null default now()
+);
+create index if not exists idx_portfolio_shares_owner on portfolio_shares (owner_user_id);
+create index if not exists idx_portfolio_shares_shared_with on portfolio_shares (shared_with_user_id);
+create unique index if not exists idx_portfolio_shares_unique on portfolio_shares (owner_user_id, shared_with_user_id, portfolio_id);
+
 -- ── Row Level Security ──────────────────────────────────────────────────────
 -- NOTE: this project deviates here from the brief's agreed scope (Section 2:
 -- "single portfolio, no login, keep it simple") — it's a full multi-user app
@@ -227,9 +342,67 @@ alter table portfolio_value_history enable row level security;
 alter table portfolio_history enable row level security;
 alter table realized_gains enable row level security;
 alter table transactions enable row level security;
+alter table price_alerts enable row level security;
+alter table watchlist enable row level security;
+alter table dividends enable row level security;
+alter table target_allocations enable row level security;
+alter table portfolio_shares enable row level security;
 
 create policy "users manage own portfolios" on portfolios for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
 create policy "users manage own holdings" on holdings for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+create policy "users manage own price_alerts" on price_alerts for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+create policy "users manage own watchlist" on watchlist for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+create policy "users manage own dividends" on dividends for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+create policy "users manage own target_allocations" on target_allocations for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+
+-- Day 26 ("view-only sharing"): the owner side is full CRUD (create an
+-- invite, see who they've shared with, revoke it); the recipient side is
+-- select-only, and additionally allowed to delete their OWN row (so they can
+-- "leave"/stop viewing without needing the owner to do it for them).
+create policy "owners manage their portfolio_shares" on portfolio_shares for all using (auth.uid() = owner_user_id) with check (auth.uid() = owner_user_id);
+create policy "recipients view their portfolio_shares" on portfolio_shares for select using (auth.uid() = shared_with_user_id);
+create policy "recipients can remove themselves" on portfolio_shares for delete using (auth.uid() = shared_with_user_id);
+
+-- Day 26 ("view-only sharing"): ADDITIVE select-only policies — these don't
+-- replace the "users manage own X" policies above (Postgres RLS OR's every
+-- permissive policy for the same command together), they just widen who can
+-- SELECT. A shared viewer still can't insert/update/delete anything of the
+-- owner's, on any table, ever. Deliberately scoped to just holdings,
+-- portfolios, and the two value-history tables — notes, dividends,
+-- transactions, watchlist, and price alerts stay private to the owner even
+-- when a portfolio is shared.
+create policy "shared viewers can read shared holdings" on holdings for select using (
+  exists (
+    select 1 from portfolio_shares ps
+    where ps.owner_user_id = holdings.user_id
+      and ps.shared_with_user_id = auth.uid()
+      and (ps.portfolio_id is null or ps.portfolio_id = holdings.portfolio_id)
+  )
+);
+create policy "shared viewers can read shared portfolios" on portfolios for select using (
+  exists (
+    select 1 from portfolio_shares ps
+    where ps.owner_user_id = portfolios.user_id
+      and ps.shared_with_user_id = auth.uid()
+      and (ps.portfolio_id is null or ps.portfolio_id = portfolios.id)
+  )
+);
+create policy "shared viewers can read shared portfolio_value_history" on portfolio_value_history for select using (
+  exists (
+    select 1 from portfolio_shares ps
+    where ps.owner_user_id = portfolio_value_history.user_id
+      and ps.shared_with_user_id = auth.uid()
+      and ps.portfolio_id is null -- whole-account history only makes sense for an "all portfolios" share
+  )
+);
+create policy "shared viewers can read shared portfolio_history" on portfolio_history for select using (
+  exists (
+    select 1 from portfolio_shares ps
+    where ps.owner_user_id = portfolio_history.user_id
+      and ps.shared_with_user_id = auth.uid()
+      and (ps.portfolio_id is null or ps.portfolio_id = portfolio_history.portfolio_id)
+  )
+);
 create policy "authenticated read/write prices" on prices for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
 create policy "authenticated read/write fx_rates" on fx_rates for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
 create policy "users manage own daily_reports" on daily_reports for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
@@ -337,3 +510,126 @@ create policy "users insert own transactions" on transactions for insert with ch
 -- ledger only starts recording events from whenever this table exists.
 -- Existing holdings/realized_gains history stays exactly as accurate as it
 -- already was; this doesn't rewrite anything.
+
+-- ── Migration: Day 26 feature batch (price alerts, watchlist, position notes,
+--    dividend log, target allocations, view-only sharing) ──────────────────
+-- Run this whole block once if your database predates these tables/column.
+-- Every `create table if not exists` / `add column if not exists` here is
+-- safe to run even if some of these already exist — Postgres just skips them.
+--
+--   alter table holdings add column if not exists notes text;
+--
+--   create table if not exists price_alerts (
+--     id              uuid primary key default gen_random_uuid(),
+--     user_id         uuid not null references auth.users (id) on delete cascade,
+--     ticker          text not null,
+--     condition       text not null check (condition in ('above', 'below')),
+--     target_price    numeric not null check (target_price > 0),
+--     active          boolean not null default true,
+--     triggered_at    timestamptz,
+--     triggered_price numeric,
+--     created_at      timestamptz not null default now()
+--   );
+--   create index if not exists idx_price_alerts_user on price_alerts (user_id);
+--   create index if not exists idx_price_alerts_active_ticker on price_alerts (ticker) where active;
+--   alter table price_alerts enable row level security;
+--   create policy "users manage own price_alerts" on price_alerts for all
+--     using (auth.uid() = user_id) with check (auth.uid() = user_id);
+--
+--   create table if not exists watchlist (
+--     id         uuid primary key default gen_random_uuid(),
+--     user_id    uuid not null references auth.users (id) on delete cascade,
+--     ticker     text not null,
+--     notes      text,
+--     created_at timestamptz not null default now()
+--   );
+--   create index if not exists idx_watchlist_user on watchlist (user_id);
+--   create unique index if not exists idx_watchlist_user_ticker on watchlist (user_id, ticker);
+--   alter table watchlist enable row level security;
+--   create policy "users manage own watchlist" on watchlist for all
+--     using (auth.uid() = user_id) with check (auth.uid() = user_id);
+--
+--   create table if not exists dividends (
+--     id         uuid primary key default gen_random_uuid(),
+--     user_id    uuid not null references auth.users (id) on delete cascade,
+--     ticker     text not null,
+--     amount     numeric not null check (amount > 0),
+--     currency   text not null default 'USD',
+--     pay_date   date not null,
+--     notes      text,
+--     created_at timestamptz not null default now()
+--   );
+--   create index if not exists idx_dividends_user_date on dividends (user_id, pay_date desc);
+--   alter table dividends enable row level security;
+--   create policy "users manage own dividends" on dividends for all
+--     using (auth.uid() = user_id) with check (auth.uid() = user_id);
+--
+--   create table if not exists target_allocations (
+--     id         uuid primary key default gen_random_uuid(),
+--     user_id    uuid not null references auth.users (id) on delete cascade,
+--     key_type   text not null check (key_type in ('asset_type', 'ticker')),
+--     key_value  text not null,
+--     target_pct numeric not null check (target_pct >= 0 and target_pct <= 100),
+--     created_at timestamptz not null default now()
+--   );
+--   create index if not exists idx_target_allocations_user on target_allocations (user_id);
+--   create unique index if not exists idx_target_allocations_user_key on target_allocations (user_id, key_type, key_value);
+--   alter table target_allocations enable row level security;
+--   create policy "users manage own target_allocations" on target_allocations for all
+--     using (auth.uid() = user_id) with check (auth.uid() = user_id);
+--
+--   create table if not exists portfolio_shares (
+--     id                  uuid primary key default gen_random_uuid(),
+--     owner_user_id       uuid not null references auth.users (id) on delete cascade,
+--     shared_with_user_id uuid not null references auth.users (id) on delete cascade,
+--     shared_with_email   text not null,
+--     owner_email         text not null,
+--     portfolio_id        uuid references portfolios (id) on delete cascade,
+--     created_at          timestamptz not null default now()
+--   );
+--   create index if not exists idx_portfolio_shares_owner on portfolio_shares (owner_user_id);
+--   create index if not exists idx_portfolio_shares_shared_with on portfolio_shares (shared_with_user_id);
+--   create unique index if not exists idx_portfolio_shares_unique on portfolio_shares (owner_user_id, shared_with_user_id, portfolio_id);
+--   alter table portfolio_shares enable row level security;
+--   create policy "owners manage their portfolio_shares" on portfolio_shares for all
+--     using (auth.uid() = owner_user_id) with check (auth.uid() = owner_user_id);
+--   create policy "recipients view their portfolio_shares" on portfolio_shares for select
+--     using (auth.uid() = shared_with_user_id);
+--   create policy "recipients can remove themselves" on portfolio_shares for delete
+--     using (auth.uid() = shared_with_user_id);
+--
+--   create policy "shared viewers can read shared holdings" on holdings for select using (
+--     exists (
+--       select 1 from portfolio_shares ps
+--       where ps.owner_user_id = holdings.user_id
+--         and ps.shared_with_user_id = auth.uid()
+--         and (ps.portfolio_id is null or ps.portfolio_id = holdings.portfolio_id)
+--     )
+--   );
+--   create policy "shared viewers can read shared portfolios" on portfolios for select using (
+--     exists (
+--       select 1 from portfolio_shares ps
+--       where ps.owner_user_id = portfolios.user_id
+--         and ps.shared_with_user_id = auth.uid()
+--         and (ps.portfolio_id is null or ps.portfolio_id = portfolios.id)
+--     )
+--   );
+--   create policy "shared viewers can read shared portfolio_value_history" on portfolio_value_history for select using (
+--     exists (
+--       select 1 from portfolio_shares ps
+--       where ps.owner_user_id = portfolio_value_history.user_id
+--         and ps.shared_with_user_id = auth.uid()
+--         and ps.portfolio_id is null
+--     )
+--   );
+--   create policy "shared viewers can read shared portfolio_history" on portfolio_history for select using (
+--     exists (
+--       select 1 from portfolio_shares ps
+--       where ps.owner_user_id = portfolio_history.user_id
+--         and ps.shared_with_user_id = auth.uid()
+--         and (ps.portfolio_id is null or ps.portfolio_id = portfolio_history.portfolio_id)
+--     )
+--   );
+--
+-- None of this touches existing data — every new table starts empty, and
+-- `notes` on existing holdings comes back null (shown as blank, not an error).

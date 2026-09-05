@@ -5,6 +5,15 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Portfolio Tracker</title>
   <link rel="stylesheet" href="style.css" />
+  <!-- Day 26 ("PWA / add-to-homescreen"). manifest.json + sw.js (registered
+       at the bottom of app.js) are what make "Add to Home Screen"/"Install"
+       show up in a mobile or desktop browser — see README for what this
+       does and doesn't get you (still just a bookmarked web page under the
+       hood, not a native app; no push notifications). -->
+  <link rel="manifest" href="manifest.json" />
+  <meta name="theme-color" content="#111111" />
+  <link rel="icon" href="icons/icon-192.png" />
+  <link rel="apple-touch-icon" href="icons/icon-192.png" />
   <!-- Set the theme attribute BEFORE the page paints (blocking, in <head>)
        so there's no flash of the wrong theme on load — by the time app.js
        runs at the bottom of <body>, the browser has already rendered once.
@@ -84,7 +93,7 @@
     </p>
     <button type="button" id="forgotPasswordBtn" class="link-btn">Forgot password?</button>
     <p class="form-error" id="loginError" aria-live="polite"></p>
-    <p class="login-hint" id="loginHint"></p>
+    <p class="login-hint auto-clear-status" id="loginHint"></p>
     <!-- Trust cues (Day 23): terms/privacy links before any credentials are
          entered, per the review's "no terms/privacy links" finding. -->
     <p class="login-legal">By continuing, you agree to the <a href="terms.html" target="_blank" rel="noopener">Terms</a> and <a href="privacy.html" target="_blank" rel="noopener">Privacy Policy</a>.</p>
@@ -101,11 +110,11 @@
     <p class="login-hint">Enter your account email and we'll send you a link to set a new password.</p>
     <form id="forgotPasswordForm" novalidate>
       <input name="email" type="email" placeholder="Email" aria-label="Email" required autocomplete="username" />
-      <button type="submit">Send reset link</button>
+      <button type="submit" id="forgotSubmitBtn">Send reset link</button>
     </form>
     <button type="button" id="cancelForgotPasswordBtn" class="link-btn">Back to sign in</button>
     <p class="form-error" id="forgotPasswordError" aria-live="polite"></p>
-    <p class="login-hint" id="forgotPasswordHint" aria-live="polite"></p>
+    <p class="login-hint auto-clear-status" id="forgotPasswordHint" aria-live="polite"></p>
   </section>
 
   <!-- Shown only when the user arrives via a Supabase password-reset email
@@ -121,11 +130,11 @@
         <input name="confirmPassword" type="password" placeholder="Confirm new password" aria-label="Confirm new password" required autocomplete="new-password" minlength="6" />
         <button type="button" class="show-password-toggle" aria-label="Show password" aria-pressed="false">Show</button>
       </div>
-      <button type="submit">Update password</button>
+      <button type="submit" id="resetSubmitBtn">Update password</button>
     </form>
     <button type="button" id="cancelResetBtn" class="link-btn">Back to sign in</button>
     <p class="form-error" id="resetPasswordError" aria-live="polite"></p>
-    <p class="login-hint" id="resetPasswordHint"></p>
+    <p class="login-hint auto-clear-status" id="resetPasswordHint"></p>
   </section>
 
   <div id="appContent" style="display: none">
@@ -138,7 +147,7 @@
     <section class="quick-actions" id="quickActions">
       <button type="button" id="fetchPricesBtn">Fetch prices</button>
       <button type="button" id="runNowBtn">Run now</button>
-      <span class="quick-actions-status" id="quickActionsStatus"></span>
+      <span class="quick-actions-status auto-clear-status" id="quickActionsStatus"></span>
     </section>
 
     <section class="portfolio-bar" id="portfolioBar">
@@ -169,6 +178,12 @@
         <span class="label">Realized gain/loss</span>
         <span class="value" id="totalRealizedGain">—</span>
       </div>
+      <!-- Day 26 ("Time-weighted return"). See computeTWR() in app.js for the
+           approximation this uses and its documented limitation. -->
+      <div class="stat">
+        <span class="label" title="Time-weighted return — approximates each day's real market return by treating that day's change in cost basis (buys/sells) as a cash flow, then geometrically links the daily returns. Not a precise TWR (no intra-day cash-flow timing), but far closer to 'how well did my actual picks perform' than a simple gain % when you've added or removed money over time.">Time-weighted return ⓘ</span>
+        <span class="value" id="twrValue">—</span>
+      </div>
     </section>
 
     <section class="chart-section" id="chartSection">
@@ -179,6 +194,23 @@
         <button type="button" data-range="1Y">1Y</button>
         <button type="button" data-range="all" class="active">All</button>
       </div>
+      <!-- Day 26 ("Benchmark overlay"). Purely a display preference (stored
+           in localStorage, see app.js) — normalizes the benchmark ticker's
+           closing price to the same starting value as your portfolio on the
+           chart's first plotted date, so the two lines are comparable as
+           "which grew faster" regardless of your portfolio's actual dollar
+           size. -->
+      <div class="benchmark-picker">
+        <label for="benchmarkSelect">Compare against</label>
+        <select id="benchmarkSelect">
+          <option value="">None</option>
+          <option value="SPY">S&amp;P 500 (SPY)</option>
+          <option value="QQQ">Nasdaq 100 (QQQ)</option>
+          <option value="VTI">Total US Market (VTI)</option>
+          <option value="custom">Custom ticker…</option>
+        </select>
+        <input type="text" id="benchmarkCustomInput" placeholder="Ticker" aria-label="Custom benchmark ticker" maxlength="10" style="display: none" />
+      </div>
       <div class="chart-wrap">
         <svg id="valueChart" viewBox="0 0 700 260" preserveAspectRatio="none" role="img" aria-labelledby="chartHeading" aria-describedby="chartCaption"></svg>
         <div class="chart-tooltip" id="chartTooltip" style="display: none"></div>
@@ -186,6 +218,7 @@
       <div class="chart-legend">
         <span class="chart-legend-item"><span class="chart-legend-swatch swatch-value"></span>Market value</span>
         <span class="chart-legend-item"><span class="chart-legend-swatch swatch-cost"></span>Total buy-in (cost basis)</span>
+        <span class="chart-legend-item" id="benchmarkLegendItem" style="display: none"><span class="chart-legend-swatch swatch-benchmark"></span><span id="benchmarkLegendLabel">Benchmark</span></span>
       </div>
       <p class="chart-caption" id="chartCaption">No history yet — run a backfill or check back after a few scheduled runs.</p>
       <!-- Accessible fallback for the hand-drawn SVG chart above (WCAG 1.1.1):
@@ -221,6 +254,40 @@
       </div>
     </section>
 
+    <!-- Day 26 ("Target allocation + rebalancing hints"). Targets are set
+         either per asset_type or per specific ticker (target_allocations
+         table) and compared against the CURRENT weight already computed for
+         the Allocation section above / the holdings table's Weight column.
+         Deliberately doesn't enforce targets summing to 100% — see
+         schema.sql comment on target_allocations. -->
+    <section class="target-allocation" id="targetAllocationSection">
+      <h2>Target Allocation</h2>
+      <p class="section-hint">Set a target weight per asset type or ticker; the gap column is a rough rebalancing hint (positive = under target, buy more; negative = over target, consider trimming). Compares against whichever portfolio filter is selected above.</p>
+      <form id="targetAllocationForm" novalidate>
+        <select name="key_type" id="targetKeyType" aria-label="Target by">
+          <option value="asset_type">Asset type</option>
+          <option value="ticker">Ticker</option>
+        </select>
+        <select name="key_value" id="targetKeyValueSelect" aria-label="Asset type">
+          <option value="stock">Stock</option>
+          <option value="etf">ETF</option>
+          <option value="fund">Fund</option>
+        </select>
+        <input name="key_value_ticker" id="targetKeyValueTicker" placeholder="Ticker (e.g. AAPL)" aria-label="Ticker" maxlength="10" style="display: none" />
+        <input name="target_pct" type="number" step="any" min="0" max="100" placeholder="Target %" aria-label="Target percent" required />
+        <button type="submit" id="targetAllocationSubmitBtn">Set target</button>
+      </form>
+      <p class="form-error" id="targetAllocationError" aria-live="polite"></p>
+      <table>
+        <thead>
+          <tr><th scope="col">Target</th><th scope="col">Target %</th><th scope="col">Current %</th><th scope="col">Gap</th><th scope="col"><span class="sr-only">Actions</span></th></tr>
+        </thead>
+        <tbody id="targetAllocationBody">
+          <tr><td colspan="5">No targets set yet — add one above.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
     <section class="add-holding">
       <h2 id="holdingFormTitle">Add a holding</h2>
       <form id="holdingForm" novalidate>
@@ -249,11 +316,14 @@
           <option value="INR">INR</option>
         </select>
         <input name="buy_date" type="date" id="buyDateInput" aria-label="Buy date" required />
+        <!-- Day 26 ("Position notes") — freeform, private, never sent
+             anywhere but this row's own `notes` column (schema.sql). -->
+        <textarea name="notes" id="holdingNotesInput" placeholder="Notes (optional) — e.g. \"core position, don't touch\"" aria-label="Notes" rows="2"></textarea>
         <button type="submit" id="formSubmitBtn">Add holding</button>
         <button type="button" id="cancelEditBtn" style="display: none">Cancel edit</button>
       </form>
       <p class="form-error" id="formError" aria-live="polite"></p>
-      <p class="form-status" id="formStatus"></p>
+      <p class="form-status auto-clear-status" id="formStatus"></p>
     </section>
 
     <section class="holdings">
@@ -269,19 +339,69 @@
         <button type="button" id="importHoldingsBtn" class="export-btn">Import CSV</button>
         <input type="file" id="importHoldingsFile" accept=".csv,text/csv" style="display: none" aria-hidden="true" tabindex="-1" />
       </h2>
-      <p class="import-status" id="importStatus" aria-live="polite"></p>
-      <input type="text" id="holdingsSearch" class="holdings-search" placeholder="Search by ticker…" aria-label="Search holdings by ticker" autocomplete="off" />
+      <p class="import-status auto-clear-status" id="importStatus" aria-live="polite"></p>
+      <input type="text" id="holdingsSearch" class="holdings-search" placeholder="Search by ticker or portfolio…" aria-label="Search holdings by ticker or portfolio" autocomplete="off" />
       <table id="holdingsTable">
         <thead>
           <tr>
             <th scope="col" data-sort="ticker">Ticker</th><th scope="col" data-sort="portfolio">Portfolio</th><th scope="col" data-sort="type">Type</th>
             <th scope="col" data-sort="qty">Qty</th><th scope="col" data-sort="buyPrice">Buy Price</th><th scope="col" data-sort="price">Current Price</th>
+            <th scope="col">Trend</th>
             <th scope="col" data-sort="value">Value</th><th scope="col" data-sort="day">Day %</th><th scope="col" data-sort="gain">Gain/Loss %</th>
             <th scope="col" data-sort="weight">Weight</th><th scope="col"><span class="sr-only">Actions</span></th>
           </tr>
         </thead>
         <tbody id="holdingsBody">
-          <tr><td colspan="11">Loading…</td></tr>
+          <tr class="skeleton-row"><td colspan="12"><span class="skeleton-bar"></span><span class="sr-only">Loading holdings…</span></td></tr>
+          <tr class="skeleton-row"><td colspan="12"><span class="skeleton-bar"></span></td></tr>
+          <tr class="skeleton-row"><td colspan="12"><span class="skeleton-bar"></span></td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- Day 26 ("Watchlist"). Tickers you don't own — separate table, never
+         touches quantity/cost-basis math (schema.sql). Prices come from the
+         same shared `prices` cache the holdings table reads. -->
+    <section class="watchlist" id="watchlistSection">
+      <h2>Watchlist</h2>
+      <form id="watchlistForm" novalidate>
+        <input name="ticker" id="watchlistTickerInput" placeholder="Ticker (e.g. NVDA)" aria-label="Ticker to watch" required maxlength="10" autocomplete="off" />
+        <input name="notes" id="watchlistNotesInput" placeholder="Notes (optional)" aria-label="Watchlist notes" />
+        <button type="submit" id="watchlistSubmitBtn">Add to watchlist</button>
+      </form>
+      <p class="form-error" id="watchlistError" aria-live="polite"></p>
+      <table>
+        <thead>
+          <tr><th scope="col">Ticker</th><th scope="col">Price</th><th scope="col">Day %</th><th scope="col">Notes</th><th scope="col"><span class="sr-only">Actions</span></th></tr>
+        </thead>
+        <tbody id="watchlistBody">
+          <tr><td colspan="5">Nothing on your watchlist yet.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- Day 26 ("Price alerts"). Checked once per scheduled/manual Worker
+         run against that run's fetched price — see worker/src/index.js
+         processUserDailyJob and schema.sql's price_alerts comment for why
+         this isn't continuous/real-time. -->
+    <section class="price-alerts" id="priceAlertsSection">
+      <h2>Price Alerts</h2>
+      <form id="priceAlertForm" novalidate>
+        <input name="ticker" id="alertTickerInput" placeholder="Ticker (e.g. AAPL)" aria-label="Alert ticker" required maxlength="10" autocomplete="off" />
+        <select name="condition" aria-label="Alert condition" required>
+          <option value="above">Rises above</option>
+          <option value="below">Falls below</option>
+        </select>
+        <input name="target_price" type="number" step="any" min="0.000001" placeholder="Target price" aria-label="Target price" required />
+        <button type="submit" id="priceAlertSubmitBtn">Set alert</button>
+      </form>
+      <p class="form-error" id="priceAlertError" aria-live="polite"></p>
+      <table>
+        <thead>
+          <tr><th scope="col">Ticker</th><th scope="col">Condition</th><th scope="col">Target</th><th scope="col">Status</th><th scope="col"><span class="sr-only">Actions</span></th></tr>
+        </thead>
+        <tbody id="priceAlertsBody">
+          <tr><td colspan="5">No price alerts set yet.</td></tr>
         </tbody>
       </table>
     </section>
@@ -299,7 +419,7 @@
           <option value="INR">INR</option>
         </select>
         <input name="sell_date" type="date" id="sellDateInput" aria-label="Sell date" required />
-        <button type="submit">Record sale</button>
+        <button type="submit" id="sellSubmitBtn">Record sale</button>
         <button type="button" id="cancelSellBtn">Cancel</button>
       </form>
       <p class="form-error" id="sellError" aria-live="polite"></p>
@@ -312,7 +432,42 @@
           <tr><th scope="col">Ticker</th><th scope="col">Qty</th><th scope="col">Buy Price</th><th scope="col">Sell Price</th><th scope="col">Sell Date</th><th scope="col">Gain/Loss</th></tr>
         </thead>
         <tbody id="realizedGainsBody">
-          <tr><td colspan="6">Loading…</td></tr>
+          <tr class="skeleton-row"><td colspan="6"><span class="skeleton-bar"></span><span class="sr-only">Loading realized gains…</span></td></tr>
+          <tr class="skeleton-row"><td colspan="6"><span class="skeleton-bar"></span></td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- Day 26 ("Dividend log — manual entry"). Neither Twelve Data's free
+         tier nor this app's data sources include dividend history, so this
+         is hand-entered. Purely informational: it doesn't feed into
+         gain/loss math anywhere else (a real "total return including
+         dividends" figure would need to, but that's out of scope here — see
+         README Known Limitations). -->
+    <section class="dividend-log" id="dividendLogSection">
+      <h2>Dividend Log</h2>
+      <form id="dividendForm" novalidate>
+        <input name="ticker" id="dividendTickerInput" placeholder="Ticker (e.g. AAPL)" aria-label="Dividend ticker" required maxlength="10" autocomplete="off" />
+        <input name="amount" type="number" step="any" min="0.000001" placeholder="Amount received" aria-label="Dividend amount" required />
+        <select name="currency" id="dividendCurrencySelect" aria-label="Dividend currency" required>
+          <option value="USD">USD</option>
+          <option value="EUR">EUR</option>
+          <option value="GBP">GBP</option>
+          <option value="JPY">JPY</option>
+          <option value="INR">INR</option>
+        </select>
+        <input name="pay_date" type="date" id="dividendDateInput" aria-label="Pay date" required />
+        <input name="notes" id="dividendNotesInput" placeholder="Notes (optional)" aria-label="Dividend notes" />
+        <button type="submit" id="dividendSubmitBtn">Log dividend</button>
+      </form>
+      <p class="form-error" id="dividendError" aria-live="polite"></p>
+      <p class="section-hint" id="dividendTotalHint"></p>
+      <table>
+        <thead>
+          <tr><th scope="col">Date</th><th scope="col">Ticker</th><th scope="col">Amount</th><th scope="col">Notes</th><th scope="col"><span class="sr-only">Actions</span></th></tr>
+        </thead>
+        <tbody id="dividendsBody">
+          <tr><td colspan="5">No dividends logged yet.</td></tr>
         </tbody>
       </table>
     </section>
@@ -328,10 +483,11 @@
       <h2>Transaction History <button type="button" id="exportTransactionsBtn" class="export-btn">Export CSV</button></h2>
       <table>
         <thead>
-          <tr><th scope="col">Date</th><th scope="col">Event</th><th scope="col">Ticker</th><th scope="col">Qty</th><th scope="col">Price</th><th scope="col">Notes</th></tr>
+          <tr><th scope="col">Date</th><th scope="col">Event</th><th scope="col">Ticker</th><th scope="col">Qty</th><th scope="col">Price</th><th scope="col">Notes</th><th scope="col"><span class="sr-only">Actions</span></th></tr>
         </thead>
         <tbody id="transactionsBody">
-          <tr><td colspan="6">Loading…</td></tr>
+          <tr class="skeleton-row"><td colspan="7"><span class="skeleton-bar"></span><span class="sr-only">Loading transaction history…</span></td></tr>
+          <tr class="skeleton-row"><td colspan="7"><span class="skeleton-bar"></span></td></tr>
         </tbody>
       </table>
     </section>
@@ -344,6 +500,48 @@
          /delete-account (see worker/src/index.js), the one action that
          genuinely needs the service_role key, since removing the actual
          auth.users row isn't something the anon-key client can do itself. -->
+    <!-- Day 26 ("Multi-account/household view — view-only sharing"). Grants
+         another signed-up user READ-ONLY access to your holdings/portfolios/
+         value history (never notes, dividends, transactions, watchlist, or
+         alerts — see schema.sql's portfolio_shares RLS policies). Inviting
+         by email requires resolving that email to a Supabase Auth user id,
+         which the anon key can't do — see the Worker's /find-user-by-email
+         route (worker/src/index.js). -->
+    <section class="sharing-section" id="sharingSection">
+      <h2>Sharing</h2>
+      <p class="section-hint">Share view-only access to your portfolio with someone else who has a Portfolio Tracker account. They'll be able to see holdings and value history, never edit, sell, or delete anything, and never see your notes, dividends, transactions, watchlist, or alerts.</p>
+      <form id="shareForm" novalidate>
+        <input name="email" id="shareEmailInput" type="email" placeholder="Their account email" aria-label="Email to share with" required autocomplete="off" />
+        <select name="portfolio_id" id="sharePortfolioSelect" aria-label="Portfolio to share">
+          <option value="">All portfolios</option>
+        </select>
+        <button type="submit" id="shareSubmitBtn">Share</button>
+      </form>
+      <p class="form-error" id="shareError" aria-live="polite"></p>
+      <p class="login-hint auto-clear-status" id="shareHint" aria-live="polite"></p>
+
+      <h3>People you've shared with</h3>
+      <table>
+        <thead><tr><th scope="col">Email</th><th scope="col">Scope</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
+        <tbody id="sharesGrantedBody"><tr><td colspan="3">You haven't shared your portfolio with anyone.</td></tr></tbody>
+      </table>
+
+      <h3>Shared with you</h3>
+      <table>
+        <thead><tr><th scope="col">Owner</th><th scope="col">Scope</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
+        <tbody id="sharesReceivedBody"><tr><td colspan="3">No one has shared a portfolio with you.</td></tr></tbody>
+      </table>
+
+      <!-- Populated only while actively viewing someone else's shared
+           portfolio (see app.js viewSharedPortfolio) — a persistent, obvious
+           "you are looking at someone else's data, read-only" banner rather
+           than a subtle mode switch that could be missed. -->
+      <div class="shared-view-banner" id="sharedViewBanner" style="display: none">
+        <span id="sharedViewLabel"></span>
+        <button type="button" id="exitSharedViewBtn">Back to my portfolio</button>
+      </div>
+    </section>
+
     <section class="account-section" id="accountSection">
       <h2>Account</h2>
       <div class="account-action-row">
@@ -361,7 +559,7 @@
         <button type="button" id="deleteAccountBtn" class="del-btn">Delete my account</button>
       </div>
       <p class="form-error" id="accountError" aria-live="polite"></p>
-      <p class="login-hint" id="accountHint" aria-live="polite"></p>
+      <p class="login-hint auto-clear-status" id="accountHint" aria-live="polite"></p>
     </section>
 
     <footer>

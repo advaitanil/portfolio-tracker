@@ -4,6 +4,17 @@
 // prices in the database" is the single most important design decision here).
 // The Cloudflare Worker is what refreshes those caches on a schedule.
 
+// Day 26 ("PWA / add-to-homescreen"). Registers sw.js, which only ever
+// caches the static app shell (see that file's own comment) — never
+// Supabase/Worker responses, so this can't cause stale prices or holdings.
+// Wrapped in a feature check + try/catch since this must never be able to
+// break the app in a browser without service worker support.
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("/sw.js").catch((err) => console.warn("Service worker registration failed (app still works normally):", err.message));
+  });
+}
+
 // Day 24: "Remember me" toggle on the sign-in form. Supabase's client
 // persists the session via whatever storage object it's given — by default
 // always localStorage, which survives closing the browser entirely. This
@@ -69,6 +80,40 @@ document.querySelectorAll(".show-password-toggle").forEach((btn) => {
     btn.setAttribute("aria-label", showing ? "Show password" : "Hide password");
   });
 });
+
+// Day 25 ("Auto-clearing status messages"): any element with this class gets
+// its text cleared a few seconds after it's set, so a success/status message
+// doesn't sit there stale until the next unrelated action. Deliberately
+// generic (a MutationObserver per element) instead of touching every call
+// site that sets one of these — new call sites get the behavior for free.
+// Two things are excluded from clearing: an element carrying the "negative"
+// class (errors should stay until the user acts, not vanish on a timer),
+// and text ending in "…" (this codebase's consistent convention for an
+// in-progress message like "Importing…" — clearing that while the operation
+// is still running would look like it silently failed).
+document.querySelectorAll(".auto-clear-status").forEach((el) => {
+  let timer = null;
+  const observer = new MutationObserver(() => {
+    clearTimeout(timer);
+    const text = el.textContent.trim();
+    if (!text || el.classList.contains("negative") || text.endsWith("…")) return;
+    timer = setTimeout(() => {
+      el.textContent = "";
+    }, 5000);
+  });
+  observer.observe(el, { childList: true, characterData: true, subtree: true });
+});
+
+// Day 25 ("Pinned last-synced freshness indicator"): the header itself is
+// `position: sticky` (see style.css); this just toggles a border/shadow once
+// it's actually stuck to the top, so it visually reads as "pinned" rather
+// than looking identical whether you've scrolled or not.
+const appHeaderEl = document.querySelector("#appContent > header");
+if (appHeaderEl) {
+  const toggleStuck = () => appHeaderEl.classList.toggle("is-stuck", window.scrollY > 4);
+  window.addEventListener("scroll", toggleStuck, { passive: true });
+  toggleStuck();
+}
 
 const STALE_AFTER_MS = 1000 * 60 * 60 * 24; // stocks/ETFs trade intraday — flag stale after 24h
 // Day 12: funds priced once/day (NAV) shouldn't be flagged stale on the same
@@ -384,13 +429,19 @@ function computeRow(holding, priceRow, fxRates, buyFxOverride, fxRatesYesterday)
 
 async function loadHoldings() {
   const tbody = document.getElementById("holdingsBody");
-  const { data: holdings, error } = await sb.from("holdings").select("*").order("created_at");
+  // Day 26 ("view-only sharing"): explicit user_id filter. Without it, once
+  // ANY share exists, the additive "shared viewers can read shared
+  // holdings" RLS policy would mix another account's rows into your own
+  // normal dashboard load — this is what actually switches between "my
+  // data" and "the portfolio someone shared with me", not just a UI toggle.
+  const viewingUserId = sharedViewOwnerId || currentUserId;
+  const { data: holdings, error } = await sb.from("holdings").select("*").eq("user_id", viewingUserId).order("created_at");
   if (error) {
-    tbody.innerHTML = `<tr><td colspan="11">Failed to load holdings: ${error.message}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="12">Failed to load holdings: ${error.message}</td></tr>`;
     return;
   }
   if (holdings.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="11">No holdings yet — add one below.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="12">No holdings yet — add one below.</td></tr>`;
     resetSummary();
     return;
   }
@@ -537,8 +588,11 @@ async function loadHoldings() {
 let lastHoldingsRows = [];
 let lastHoldingsTotalValue = 0;
 let holdingsSearchTerm = "";
-let holdingsSortColumn = null;
-let holdingsSortDirection = 1; // 1 = ascending, -1 = descending
+// Day 25 ("Sort persistence across reloads"): remembered in localStorage so
+// the table doesn't reset to insertion order every time you reload — just a
+// column name + direction, nothing sensitive.
+let holdingsSortColumn = localStorage.getItem("holdingsSortColumn") || null;
+let holdingsSortDirection = localStorage.getItem("holdingsSortDirection") === "-1" ? -1 : 1; // 1 = ascending, -1 = descending
 
 function holdingsSortValue(row, col) {
   const { h, currentValue, gainPct, dayChangePct, priceInBase } = row;
@@ -571,17 +625,32 @@ function renderHoldingsTable() {
   const tbody = document.getElementById("holdingsBody");
   const totalValue = lastHoldingsTotalValue;
 
+  // Built up here (not just below, where it was originally only needed for
+  // rendering) so the search filter below can also match on portfolio name.
+  // Day 26 ("view-only sharing"): while viewing someone else's shared
+  // portfolio, `allPortfolios` is still YOUR OWN list (loadPortfolios never
+  // mixes the two, see its comment) — the owner's portfolio names live in
+  // sharedOwnerPortfolioNameById instead, fetched once in viewSharedPortfolio.
+  const portfolioNameById = sharedViewOwnerId ? sharedOwnerPortfolioNameById : Object.fromEntries(allPortfolios.map((p) => [p.id, p.name]));
+
   let rows = lastHoldingsRows;
   if (holdingsSearchTerm) {
     const term = holdingsSearchTerm.toLowerCase();
-    rows = rows.filter(({ h }) => h.ticker.toLowerCase().includes(term));
+    // Day 25 ("Search across portfolio name too"): matches ticker OR the
+    // holding's portfolio name (unassigned holdings just never match on the
+    // portfolio half) — searching "retirement" now finds every holding in
+    // that portfolio, not just ones whose ticker happens to contain it.
+    rows = rows.filter(({ h }) => {
+      const portfolioName = h.portfolio_id ? portfolioNameById[h.portfolio_id] || "" : "";
+      return h.ticker.toLowerCase().includes(term) || portfolioName.toLowerCase().includes(term);
+    });
   }
 
   if (rows.length === 0) {
     tbody.innerHTML =
       lastHoldingsRows.length === 0
-        ? `<tr><td colspan="11">No holdings in this portfolio — add one below or switch to "All portfolios".</td></tr>`
-        : `<tr><td colspan="11">No holdings match "${escapeHtml(holdingsSearchTerm)}".</td></tr>`;
+        ? `<tr><td colspan="12">No holdings in this portfolio — add one below or switch to "All portfolios".</td></tr>`
+        : `<tr><td colspan="12">No holdings match "${escapeHtml(holdingsSearchTerm)}".</td></tr>`;
     updateSortIndicators();
     return;
   }
@@ -597,8 +666,6 @@ function renderHoldingsTable() {
       return cmp * holdingsSortDirection;
     });
   }
-
-  const portfolioNameById = Object.fromEntries(allPortfolios.map((p) => [p.id, p.name]));
 
   // Day 24 (review P1: "duplicate/un-aggregated holdings"). Adding/editing a
   // holding already auto-merges same-ticker rows when portfolio AND currency
@@ -640,19 +707,26 @@ function renderHoldingsTable() {
           : priceReturnPct != null
             ? `Price: ${fmtPct(priceReturnPct)} (no FX component)`
             : "";
+      // Day 26 ("Mobile card layout for holdings table"): every cell carries
+      // a data-label matching its column header. On wide screens this is
+      // unused (the CSS is scoped to the same @media breakpoint that turns
+      // the table into stacked cards); on narrow screens a td::before reads
+      // it, so each card shows "Qty  12" etc. instead of relying on a
+      // header row that's no longer visible.
       return `
     <tr>
-      <td>${h.ticker}${lotBadge}</td>
-      <td>${h.portfolio_id ? escapeHtml(portfolioNameById[h.portfolio_id] || "—") : '<span class="nav-tag">unassigned</span>'}</td>
-      <td>${h.asset_type}</td>
-      <td>${h.quantity}</td>
-      <td>${fmtMoneyIn(h.buy_price, h.buy_currency)}</td>
-      <td title="${escapeHtml(asOfTitle)}">${priceInBase != null ? fmtMoney(priceInBase) : "—"}${isFund ? '<span class="nav-tag">NAV</span>' : ""}${isStale ? '<span class="stale">stale</span>' : ""}</td>
-      <td>${fmtMoney(currentValue)}</td>
-      <td class="${pctClass(dayChangePct)}"${dayChangeTitle ? ` title="${escapeHtml(dayChangeTitle)}"` : ""}>${fmtPct(dayChangePct)}</td>
-      <td class="${pctClass(gainPct)}">${fmtPct(gainPct)}</td>
-      <td>${totalValue ? fmtPct((currentValue / totalValue) * 100).replace("+", "") : "—"}</td>
-      <td>
+      <td data-label="Ticker">${h.ticker}${lotBadge}${h.notes ? `<span class="notes-badge" title="${escapeHtml(h.notes)}" aria-label="Note: ${escapeHtml(h.notes)}">📝</span>` : ""}</td>
+      <td data-label="Portfolio">${h.portfolio_id ? escapeHtml(portfolioNameById[h.portfolio_id] || "—") : '<span class="nav-tag">unassigned</span>'}</td>
+      <td data-label="Type">${h.asset_type}</td>
+      <td class="editable-cell" data-label="Qty" data-field="quantity" data-id="${h.id}" tabindex="0" role="button" aria-label="Edit quantity for ${escapeHtml(h.ticker)}, currently ${h.quantity}">${h.quantity}</td>
+      <td class="editable-cell" data-label="Buy Price" data-field="buy_price" data-id="${h.id}" data-currency="${escapeHtml(h.buy_currency)}" tabindex="0" role="button" aria-label="Edit buy price for ${escapeHtml(h.ticker)}, currently ${fmtMoneyIn(h.buy_price, h.buy_currency)}">${fmtMoneyIn(h.buy_price, h.buy_currency)}</td>
+      <td data-label="Current Price" title="${escapeHtml(asOfTitle)}">${priceInBase != null ? fmtMoney(priceInBase) : "—"}${isFund ? '<span class="nav-tag">NAV</span>' : ""}${isStale ? '<span class="stale">stale</span>' : ""}</td>
+      <td data-label="Trend" class="sparkline-cell" data-ticker="${escapeHtml(h.ticker)}"><span class="sparkline-placeholder" aria-hidden="true">…</span></td>
+      <td data-label="Value">${fmtMoney(currentValue)}</td>
+      <td data-label="Day %" class="${pctClass(dayChangePct)}"${dayChangeTitle ? ` title="${escapeHtml(dayChangeTitle)}"` : ""}>${fmtPct(dayChangePct)}</td>
+      <td data-label="Gain/Loss %" class="${pctClass(gainPct)}">${fmtPct(gainPct)}</td>
+      <td data-label="Weight">${totalValue ? fmtPct((currentValue / totalValue) * 100).replace("+", "") : "—"}</td>
+      <td data-label="Actions">
         <button class="sell-btn" data-id="${h.id}" aria-label="Sell ${escapeHtml(h.ticker)}">Sell</button>
         <button class="edit-btn" data-id="${h.id}" aria-label="Edit ${escapeHtml(h.ticker)}">Edit</button>
         <button class="del-btn" data-id="${h.id}" aria-label="Delete ${escapeHtml(h.ticker)}">Delete</button>
@@ -674,6 +748,12 @@ function renderHoldingsTable() {
       if (!ok) return;
       await sb.from("holdings").delete().eq("id", btn.dataset.id);
       if (target) {
+        // Day 25 ("Undo for delete"): event_date stores the ORIGINAL buy_date
+        // (not today's deletion date) and asset_type rides along in a small
+        // bracket tag in notes — neither has its own column on `transactions`,
+        // and this is enough for the "Restore" button in Transaction History
+        // to fully reconstruct the row. The tag is stripped before display
+        // (see loadTransactions) so it doesn't look odd in the ledger.
         logTransaction({
           holdingId: target.id,
           portfolioId: target.portfolio_id,
@@ -682,11 +762,12 @@ function renderHoldingsTable() {
           quantity: target.quantity,
           price: target.buy_price,
           currency: target.buy_currency,
-          eventDate: new Date().toISOString().slice(0, 10),
-          notes: "Deleted (not a sale) — no realized gain recorded.",
+          eventDate: target.buy_date,
+          notes: `Deleted (not a sale) — no realized gain recorded. [asset_type:${target.asset_type}]`,
         });
       }
       loadHoldings();
+      loadTransactions();
     })
   );
 
@@ -698,7 +779,179 @@ function renderHoldingsTable() {
     btn.addEventListener("click", () => startSell(window.__holdingsById[btn.dataset.id]))
   );
 
+  // Day 26 ("Inline quantity/price editing"): click (or Enter/Space when
+  // focused) turns the quantity or buy-price cell into a small number input,
+  // in place, instead of always requiring the full Edit modal. Ticker,
+  // currency, portfolio, and asset type still go through Edit — this only
+  // covers the two fields someone is most likely to need to nudge after a
+  // stock split, a data-entry typo, or a partial fill.
+  tbody.querySelectorAll(".editable-cell").forEach((cell) => {
+    cell.addEventListener("click", () => startInlineEdit(cell));
+    cell.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        startInlineEdit(cell);
+      }
+    });
+  });
+
   updateSortIndicators();
+  loadSparklines(rows.map((r) => r.h.ticker));
+}
+
+// Day 26 ("Sparklines in holdings table"). Reuses the shared `prices` cache
+// (the same table computeRow reads "latest of" from) — this just also reads
+// its last ~30 days of appended snapshots per ticker, instead of only the
+// newest row. PostgREST has no clean "top N per group" query, so this pulls
+// every row in the date window for the tickers on screen (cheap: normal use
+// appends at most a few rows/ticker/day) and groups client-side. Best-effort
+// and non-blocking — a failure here just leaves the "…" placeholder in place,
+// it never breaks the rest of the holdings table.
+async function loadSparklines(tickers) {
+  const unique = [...new Set(tickers)];
+  if (!unique.length) return;
+  const since = new Date();
+  since.setDate(since.getDate() - 30);
+  const { data, error } = await sb
+    .from("prices")
+    .select("ticker, price, as_of")
+    .in("ticker", unique)
+    .gte("as_of", since.toISOString())
+    .not("price", "is", null)
+    .order("as_of", { ascending: true });
+  if (error || !data) return;
+
+  const byTicker = {};
+  for (const row of data) (byTicker[row.ticker] ??= []).push(row.price);
+
+  document.querySelectorAll(".sparkline-cell").forEach((cell) => {
+    const ticker = cell.dataset.ticker;
+    const series = byTicker[ticker];
+    if (!series || series.length < 2) {
+      cell.innerHTML = '<span class="sparkline-empty" title="Not enough price history yet for a trend line">—</span>';
+      return;
+    }
+    cell.innerHTML = renderSparklineSvg(series);
+  });
+}
+
+// A tiny inline-SVG line chart — deliberately not reusing renderValueChart's
+// smoothing/downsampling machinery (built for a big interactive chart with
+// tooltips/axes); a sparkline is just "shape of the last 30 days," a plain
+// straight-segment polyline through min/max-normalized points is enough.
+function renderSparklineSvg(series) {
+  const width = 64;
+  const height = 24;
+  const min = Math.min(...series);
+  const max = Math.max(...series);
+  const range = max - min || 1; // flat line (min === max) — avoid divide-by-zero
+  const step = series.length > 1 ? width / (series.length - 1) : 0;
+  const points = series.map((v, i) => `${(i * step).toFixed(1)},${(height - ((v - min) / range) * height).toFixed(1)}`).join(" ");
+  const trendUp = series[series.length - 1] >= series[0];
+  const color = trendUp ? "var(--green, #1a9c6b)" : "var(--red, #c0392b)";
+  const title = `${trendUp ? "Up" : "Down"} over the last ${series.length} cached price point${series.length === 1 ? "" : "s"} (~30 days)`;
+  return `<svg class="sparkline" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="${escapeHtml(title)}"><polyline points="${points}" fill="none" stroke="${color}" stroke-width="1.5" vector-effect="non-scaling-stroke" /></svg>`;
+}
+
+// Tracks the currently-open inline editor so a click elsewhere (or opening a
+// second one) cleanly cancels the first rather than leaving two live inputs.
+let activeInlineEdit = null;
+
+function startInlineEdit(cell) {
+  // Day 26 ("view-only sharing"): the Sell/Edit/Delete buttons are hidden
+  // entirely via CSS while viewing someone else's shared portfolio (see
+  // .shared-view-active in style.css), but this cell has no such visual
+  // affordance to hide without breaking the table's column alignment — so
+  // it needs its own explicit read-only guard instead.
+  if (sharedViewOwnerId) return;
+  if (cell.querySelector("input")) return; // already editing this cell
+  if (activeInlineEdit && activeInlineEdit !== cell) cancelInlineEdit(activeInlineEdit);
+
+  const holdingId = cell.dataset.id;
+  const field = cell.dataset.field;
+  const holding = window.__holdingsById?.[holdingId];
+  if (!holding) return;
+
+  const rawValue = field === "quantity" ? holding.quantity : holding.buy_price;
+  cell.dataset.originalHtml = cell.innerHTML;
+  activeInlineEdit = cell;
+
+  const currencySuffix = field === "buy_price" ? ` <span class="inline-edit-currency">${escapeHtml(cell.dataset.currency || "")}</span>` : "";
+  cell.innerHTML = `<input type="number" step="any" min="0" class="inline-edit-input" value="${rawValue}" aria-label="${field === "quantity" ? "Quantity" : "Buy price"}">${currencySuffix}`;
+  const input = cell.querySelector("input");
+  input.focus();
+  input.select();
+
+  let settled = false;
+  const finish = async (commit) => {
+    if (settled) return;
+    settled = true;
+    activeInlineEdit = null;
+    if (!commit) {
+      cancelInlineEdit(cell);
+      return;
+    }
+    const newValue = Number(input.value);
+    if (!(newValue > 0) || newValue === rawValue) {
+      cancelInlineEdit(cell);
+      return;
+    }
+    await commitInlineEdit(cell, holding, field, newValue);
+  };
+
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      finish(true);
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      finish(false);
+    }
+  });
+  input.addEventListener("blur", () => finish(true));
+}
+
+function cancelInlineEdit(cell) {
+  if (cell.dataset.originalHtml != null) cell.innerHTML = cell.dataset.originalHtml;
+  delete cell.dataset.originalHtml;
+  if (activeInlineEdit === cell) activeInlineEdit = null;
+}
+
+async function commitInlineEdit(cell, holding, field, newValue) {
+  const statusEl = document.getElementById("formStatus");
+  const oldValue = field === "quantity" ? holding.quantity : holding.buy_price;
+  const payload = { [field]: newValue };
+
+  const { error } = await sb.from("holdings").update(payload).eq("id", holding.id);
+  if (error) {
+    if (statusEl) {
+      statusEl.textContent = `Could not update ${field === "quantity" ? "quantity" : "buy price"}: ${error.message}`;
+      statusEl.classList.add("negative");
+    }
+    cancelInlineEdit(cell);
+    return;
+  }
+  if (statusEl) {
+    statusEl.classList.remove("negative");
+    statusEl.textContent = `Updated ${holding.ticker} ${field === "quantity" ? "quantity" : "buy price"} to ${field === "quantity" ? newValue : fmtMoneyIn(newValue, holding.buy_currency)}.`;
+  }
+  logTransaction({
+    holdingId: holding.id,
+    portfolioId: holding.portfolio_id,
+    ticker: holding.ticker,
+    eventType: "edit",
+    quantity: field === "quantity" ? newValue : holding.quantity,
+    price: field === "buy_price" ? newValue : holding.buy_price,
+    currency: holding.buy_currency,
+    eventDate: holding.buy_date,
+    notes:
+      field === "quantity"
+        ? `Quantity changed inline from ${oldValue} to ${newValue}.`
+        : `Buy price changed inline from ${fmtMoneyIn(oldValue, holding.buy_currency)} to ${fmtMoneyIn(newValue, holding.buy_currency)}.`,
+  });
+  delete cell.dataset.originalHtml;
+  loadHoldings();
+  loadTransactions();
 }
 
 function updateSortIndicators() {
@@ -723,6 +976,8 @@ document.querySelectorAll("#holdingsTable th[data-sort]").forEach((th) => {
       holdingsSortColumn = col;
       holdingsSortDirection = 1;
     }
+    localStorage.setItem("holdingsSortColumn", holdingsSortColumn);
+    localStorage.setItem("holdingsSortDirection", String(holdingsSortDirection));
     renderHoldingsTable();
   });
 });
@@ -773,14 +1028,29 @@ async function loadValueHistory() {
   const svg = document.getElementById("valueChart");
   const caption = document.getElementById("chartCaption");
   const heading = document.getElementById("chartHeading");
+  const twrEl = document.getElementById("twrValue");
 
-  const viewingAll = selectedPortfolioId === "__all__";
+  // Day 26 ("view-only sharing"): same explicit user_id filter as
+  // loadHoldings — a shared viewer stays forced to "all portfolios" (see
+  // viewSharedPortfolio), so this always reads the OWNER's whole-account
+  // history via portfolio_value_history in that mode; RLS's own
+  // "shared_viewers can read shared portfolio_value_history" policy still
+  // only allows that when the share itself is whole-account (portfolio_id
+  // is null) — a share scoped to one portfolio will correctly show no chart
+  // here rather than a wrong one (documented limitation, not a bug).
+  const viewingUserId = sharedViewOwnerId || currentUserId;
+  const viewingAll = sharedViewOwnerId ? true : selectedPortfolioId === "__all__";
   const portfolioName = viewingAll ? null : allPortfolios.find((p) => p.id === selectedPortfolioId)?.name;
   heading.textContent = viewingAll ? "Portfolio Value Over Time" : `Portfolio Value Over Time — ${portfolioName || "…"}`;
 
   const query = viewingAll
-    ? sb.from("portfolio_value_history").select("date, total_value, total_cost").order("date", { ascending: true })
-    : sb.from("portfolio_history").select("date, total_value, total_cost").eq("portfolio_id", selectedPortfolioId).order("date", { ascending: true });
+    ? sb.from("portfolio_value_history").select("date, total_value, total_cost").eq("user_id", viewingUserId).order("date", { ascending: true })
+    : sb
+        .from("portfolio_history")
+        .select("date, total_value, total_cost")
+        .eq("user_id", viewingUserId)
+        .eq("portfolio_id", selectedPortfolioId)
+        .order("date", { ascending: true });
 
   const { data, error } = await query;
 
@@ -788,6 +1058,7 @@ async function loadValueHistory() {
     svg.innerHTML = "";
     caption.textContent = `Could not load history: ${error.message}`;
     fullHistoryData = [];
+    if (twrEl) twrEl.textContent = "—";
     return;
   }
   if (!data || data.length === 0) {
@@ -799,12 +1070,105 @@ async function loadValueHistory() {
       ? "No history yet — visit <WORKER_URL>/backfill-history once to seed it from real historical prices, or check back after a few scheduled runs."
       : "No history yet for this portfolio — it'll appear after your next edit/poll (live) or the next /backfill-history run (real historical prices).";
     fullHistoryData = [];
+    if (twrEl) twrEl.textContent = "—";
     return;
   }
 
   fullHistoryData = data;
+  if (twrEl) {
+    const twr = computeTWR(fullHistoryData);
+    twrEl.textContent = twr == null ? "—" : fmtPct(twr);
+    twrEl.className = "value " + pctClass(twr);
+  }
+  if (benchmarkTicker) await ensureBenchmarkData(fullHistoryData[0].date);
   applyChartRange();
 }
+
+// Day 26 ("Time-weighted return"). Approximates each day's real market
+// return by treating that day's CHANGE in cost basis (a buy raises it, a
+// sell lowers it) as an external cash flow, backs that flow out of the
+// day's value change, then geometrically links the daily returns. This is
+// deliberately an approximation, not a textbook TWR: a true TWR needs the
+// EXACT time of each cash flow within the period (a buy at market open vs.
+// market close on the same day changes the answer), and this app only has
+// one total_cost snapshot per day — same "closest available proxy, not a
+// true point-in-time reconstruction" tradeoff already documented elsewhere
+// in this codebase (e.g. buy-date FX, portfolio membership in history.js).
+// Skips any day with missing total_cost on either side (treats that day's
+// cash flow as zero) rather than guessing.
+function computeTWR(history) {
+  if (!history || history.length < 2) return null;
+  let cumulative = 1;
+  let any = false;
+  for (let i = 1; i < history.length; i++) {
+    const prev = history[i - 1];
+    const curr = history[i];
+    if (!prev.total_value || prev.total_value <= 0) continue;
+    const cf = curr.total_cost != null && prev.total_cost != null ? curr.total_cost - prev.total_cost : 0;
+    const r = (curr.total_value - cf - prev.total_value) / prev.total_value;
+    if (!Number.isFinite(r)) continue;
+    cumulative *= 1 + r;
+    any = true;
+  }
+  return any ? (cumulative - 1) * 100 : null;
+}
+
+// Day 26 ("Benchmark overlay") — a display preference, not account data, so
+// it lives in localStorage rather than a table: it doesn't need to be
+// shared across devices or visible to anyone else, and keeping it
+// client-side means no schema/RLS surface for something this low-stakes.
+let benchmarkTicker = localStorage.getItem("benchmarkTicker") || "";
+let benchmarkRawSeriesCache = {}; // { [ticker]: { currency, series: {date: close}, since } }
+
+async function ensureBenchmarkData(sinceDate) {
+  if (!benchmarkTicker || !window.WORKER_URL) return;
+  const cached = benchmarkRawSeriesCache[benchmarkTicker];
+  if (cached && cached.since <= sinceDate) return; // already covers this range
+  try {
+    const res = await authedFetch(`${window.WORKER_URL}/benchmark-history?ticker=${encodeURIComponent(benchmarkTicker)}&since=${sinceDate}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const json = await res.json();
+    if (json.error) throw new Error(json.error);
+    benchmarkRawSeriesCache[benchmarkTicker] = { currency: json.currency, series: json.series || {}, since: sinceDate };
+  } catch (err) {
+    console.warn(`Could not load benchmark history for ${benchmarkTicker}:`, err.message);
+  }
+}
+
+const benchmarkSelectEl = document.getElementById("benchmarkSelect");
+const benchmarkCustomInputEl = document.getElementById("benchmarkCustomInput");
+// Restore whatever was picked last time — "custom" needs its text field
+// shown and populated too, since <select> alone can't represent an
+// arbitrary saved ticker.
+if (benchmarkTicker && benchmarkSelectEl && ![...benchmarkSelectEl.options].some((o) => o.value === benchmarkTicker)) {
+  benchmarkSelectEl.value = "custom";
+  if (benchmarkCustomInputEl) {
+    benchmarkCustomInputEl.style.display = "";
+    benchmarkCustomInputEl.value = benchmarkTicker;
+  }
+} else if (benchmarkSelectEl) {
+  benchmarkSelectEl.value = benchmarkTicker;
+}
+
+benchmarkSelectEl?.addEventListener("change", () => {
+  if (benchmarkSelectEl.value === "custom") {
+    benchmarkCustomInputEl.style.display = "";
+    benchmarkCustomInputEl.focus();
+    return; // wait for the custom ticker to actually be typed in (see below)
+  }
+  benchmarkCustomInputEl.style.display = "none";
+  benchmarkTicker = benchmarkSelectEl.value;
+  localStorage.setItem("benchmarkTicker", benchmarkTicker);
+  loadValueHistory();
+});
+
+benchmarkCustomInputEl?.addEventListener("change", () => {
+  const ticker = benchmarkCustomInputEl.value.trim().toUpperCase();
+  if (!ticker) return;
+  benchmarkTicker = ticker;
+  localStorage.setItem("benchmarkTicker", benchmarkTicker);
+  loadValueHistory();
+});
 
 // Slices fullHistoryData down to the selected range (Day 17) and (re)draws.
 // Falls back to showing everything if the selected range would leave fewer
@@ -873,6 +1237,39 @@ function smoothPath(pts) {
   return d;
 }
 
+// Day 26 ("Benchmark overlay") — carry-forward lookup into a { 'YYYY-MM-DD':
+// price } series, same convention as history.js's server-side carryForward:
+// markets are closed weekends/holidays, so any given plotted date uses the
+// most recent trading-day close on or before it.
+function carryForwardBenchmark(sortedDates, series, targetDate) {
+  let result = null;
+  for (const d of sortedDates) {
+    if (d > targetDate) break;
+    result = series[d];
+  }
+  return result;
+}
+
+// Rescales the benchmark's own closing-price series onto the SAME dollar
+// axis as the portfolio-value line, indexed so both start from the same
+// point on the chart's first plotted date — i.e. "if this ticker started at
+// your actual starting value, where would it be now." This is what makes
+// "which grew faster" readable as two lines sharing one y-axis, at the cost
+// of the benchmark line no longer meaning "dollars actually invested in it."
+function computeBenchmarkOverlay(points) {
+  if (!benchmarkTicker || !points.length) return null;
+  const entry = benchmarkRawSeriesCache[benchmarkTicker];
+  if (!entry || !entry.series || !Object.keys(entry.series).length) return null;
+  const sortedDates = Object.keys(entry.series).sort();
+  const basePrice = carryForwardBenchmark(sortedDates, entry.series, points[0].date);
+  const baseValue = points[0].total_value;
+  if (!basePrice || !baseValue) return null;
+  return points.map((p) => {
+    const price = carryForwardBenchmark(sortedDates, entry.series, p.date);
+    return price != null ? baseValue * (price / basePrice) : null;
+  });
+}
+
 function renderValueChart(svg, rawPoints) {
   const points = downsample(rawPoints, 90);
   const width = 700;
@@ -880,12 +1277,22 @@ function renderValueChart(svg, rawPoints) {
   const padX = 12;
   const padY = 30;
 
+  const benchmarkValues = computeBenchmarkOverlay(points);
+  const benchmarkLegendItem = document.getElementById("benchmarkLegendItem");
+  if (benchmarkLegendItem) {
+    benchmarkLegendItem.style.display = benchmarkValues ? "" : "none";
+    const label = document.getElementById("benchmarkLegendLabel");
+    if (label) label.textContent = `${benchmarkTicker} (indexed to your starting value)`;
+  }
+
   const values = points.map((p) => p.total_value);
   // Day 22: the y-domain has to cover the cost-basis ("total buy-in") line
   // too, not just market value — otherwise a portfolio deep in the red would
-  // clip its own buy-in line off the top of the chart.
+  // clip its own buy-in line off the top of the chart. Day 26: same idea for
+  // the benchmark overlay, when one's active.
   const costValues = points.map((p) => p.total_cost).filter((v) => v != null);
-  const allValues = costValues.length ? values.concat(costValues) : values;
+  const benchmarkValuesValid = (benchmarkValues || []).filter((v) => v != null);
+  const allValues = values.concat(costValues, benchmarkValuesValid);
   // Axis floors at $0 (Day 22) rather than the lowest plotted value — with
   // two lines being compared directly (value vs. buy-in), a zoomed-in axis
   // exaggerates the visual size of any gap/step between them. Math.min(0, …)
@@ -920,6 +1327,13 @@ function renderValueChart(svg, rawPoints) {
   const costCoords = costIndices.map((i) => ({ x: xAt(i), y: yAt(points[i].total_cost) }));
   const costPath = costCoords.length >= 2 ? smoothPath(costCoords) : "";
 
+  // Day 26 ("Benchmark overlay") — same dashed-reference-line treatment as
+  // the cost-basis line above, just a different color so it's visually
+  // distinct from both the market-value area and the buy-in line.
+  const benchmarkIndices = benchmarkValues ? benchmarkValues.map((v, i) => i).filter((i) => benchmarkValues[i] != null) : [];
+  const benchmarkCoords = benchmarkIndices.map((i) => ({ x: xAt(i), y: yAt(benchmarkValues[i]) }));
+  const benchmarkPath = benchmarkCoords.length >= 2 ? smoothPath(benchmarkCoords) : "";
+
   // Dashed reference lines at 25/50/75% of the visible range, each labelled —
   // gives the eye something to measure against instead of just two numbers
   // floating at the top/bottom corners.
@@ -948,6 +1362,7 @@ function renderValueChart(svg, rawPoints) {
     ${gridLines}
     <path d="${areaPath}" style="fill:${trendColor};fill-opacity:0.12" stroke="none"></path>
     ${costPath ? `<path d="${costPath}" fill="none" style="stroke:var(--muted)" stroke-width="1.75" stroke-dasharray="5,4" stroke-linecap="round" stroke-linejoin="round"></path>` : ""}
+    ${benchmarkPath ? `<path d="${benchmarkPath}" fill="none" style="stroke:var(--accent)" stroke-width="1.75" stroke-dasharray="2,3" stroke-linecap="round" stroke-linejoin="round"></path>` : ""}
     <path d="${linePath}" fill="none" style="stroke:${trendColor}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"></path>
     <rect x="${(padX - 4).toFixed(1)}" y="4" width="${maxLabelWidth.toFixed(1)}" height="16" style="fill:var(--panel);fill-opacity:0.9" rx="3"></rect>
     <text x="${padX}" y="16" style="fill:var(--muted)" font-size="11">${maxLabel}</text>
@@ -1063,9 +1478,11 @@ function startEdit(h) {
   form.buy_currency.value = h.buy_currency;
   form.buy_date.value = h.buy_date;
   form.portfolio_id.value = h.portfolio_id || "";
+  form.notes.value = h.notes || "";
   document.getElementById("holdingFormTitle").textContent = `Edit ${h.ticker}`;
   document.getElementById("formSubmitBtn").textContent = "Save changes";
   document.getElementById("cancelEditBtn").style.display = "";
+  form.scrollIntoView({ behavior: "smooth", block: "center" });
   document.getElementById("tickerInput").focus();
 }
 
@@ -1079,7 +1496,26 @@ function stopEdit() {
 document.getElementById("cancelEditBtn").addEventListener("click", () => {
   stopEdit();
   document.getElementById("holdingForm").reset();
+  holdingFormDirty = false;
   setDateToToday();
+});
+
+// Day 25 ("Unsaved-changes guard"): warns before closing the tab/reloading
+// if the Add/Edit Holding form has input that was never submitted. Scoped to
+// just this one form (not every form in the app) since it's the one people
+// are most likely to spend real time filling in before getting interrupted.
+let holdingFormDirty = false;
+const holdingFormEl = document.getElementById("holdingForm");
+holdingFormEl.addEventListener("input", () => {
+  holdingFormDirty = true;
+});
+holdingFormEl.addEventListener("change", () => {
+  holdingFormDirty = true;
+});
+window.addEventListener("beforeunload", (e) => {
+  if (!holdingFormDirty) return;
+  e.preventDefault();
+  e.returnValue = ""; // required for the confirmation dialog to appear in most browsers
 });
 
 // --- Realized gains: selling records a closed position instead of just
@@ -1100,6 +1536,7 @@ function startSell(h) {
   document.getElementById("sellError").textContent = "";
   document.getElementById("sellSection").style.display = "";
   document.getElementById("sellSection").scrollIntoView({ behavior: "smooth", block: "center" });
+  document.getElementById("sellQuantityInput").focus();
 }
 
 function stopSell() {
@@ -1130,81 +1567,83 @@ document.getElementById("sellForm").addEventListener("submit", async (e) => {
   if (sellQuantity > sellingHolding.quantity) return (errEl.textContent = `Can't sell more than the ${sellingHolding.quantity} you hold.`);
   if (!(sellPrice > 0)) return (errEl.textContent = "Sell price must be positive.");
 
-  // Day 19: the buy side now converts at the ACTUAL rate on buy_date (and
-  // the sell side at the actual rate on sell_date), not just whatever's
-  // cached "now" — falls back to the current rate for either side if no
-  // historical rate has been cached yet for that currency/date.
-  const [fxRates, histFx] = await Promise.all([
-    fetchLatestFx([sellingHolding.buy_currency, sellCurrency]).catch(() => ({ [BASE_CURRENCY]: 1 })),
-    fetchHistoricalFxForDates([
-      { currency: sellingHolding.buy_currency, date: sellingHolding.buy_date },
-      { currency: sellCurrency, date: sellDate },
-    ]).catch(() => new Map()),
-  ]);
-  const buyFx = histFx.get(`${sellingHolding.buy_currency}|${sellingHolding.buy_date}`) ?? fxRates[sellingHolding.buy_currency] ?? null;
-  const sellFx = histFx.get(`${sellCurrency}|${sellDate}`) ?? fxRates[sellCurrency] ?? null;
+  await withButtonLoading(document.getElementById("sellSubmitBtn"), "Recording…", async () => {
+    // Day 19: the buy side now converts at the ACTUAL rate on buy_date (and
+    // the sell side at the actual rate on sell_date), not just whatever's
+    // cached "now" — falls back to the current rate for either side if no
+    // historical rate has been cached yet for that currency/date.
+    const [fxRates, histFx] = await Promise.all([
+      fetchLatestFx([sellingHolding.buy_currency, sellCurrency]).catch(() => ({ [BASE_CURRENCY]: 1 })),
+      fetchHistoricalFxForDates([
+        { currency: sellingHolding.buy_currency, date: sellingHolding.buy_date },
+        { currency: sellCurrency, date: sellDate },
+      ]).catch(() => new Map()),
+    ]);
+    const buyFx = histFx.get(`${sellingHolding.buy_currency}|${sellingHolding.buy_date}`) ?? fxRates[sellingHolding.buy_currency] ?? null;
+    const sellFx = histFx.get(`${sellCurrency}|${sellDate}`) ?? fxRates[sellCurrency] ?? null;
 
-  // fxRates[currency] is "1 unit of that currency, expressed in base
-  // currency" (see fetchLatestFx above) — so converting TO base means
-  // multiplying, same as computeRow()'s priceInBase = price * fx.
-  let realizedGainAbs = null;
-  let realizedGainPct = null;
-  if (buyFx && sellFx) {
-    const buyValueBase = sellQuantity * sellingHolding.buy_price * buyFx;
-    const sellValueBase = sellQuantity * sellPrice * sellFx;
-    realizedGainAbs = sellValueBase - buyValueBase;
-    realizedGainPct = buyValueBase ? (realizedGainAbs / buyValueBase) * 100 : null;
-  }
+    // fxRates[currency] is "1 unit of that currency, expressed in base
+    // currency" (see fetchLatestFx above) — so converting TO base means
+    // multiplying, same as computeRow()'s priceInBase = price * fx.
+    let realizedGainAbs = null;
+    let realizedGainPct = null;
+    if (buyFx && sellFx) {
+      const buyValueBase = sellQuantity * sellingHolding.buy_price * buyFx;
+      const sellValueBase = sellQuantity * sellPrice * sellFx;
+      realizedGainAbs = sellValueBase - buyValueBase;
+      realizedGainPct = buyValueBase ? (realizedGainAbs / buyValueBase) * 100 : null;
+    }
 
-  const { error: insertError } = await sb.from("realized_gains").insert({
-    user_id: currentUserId,
-    ticker: sellingHolding.ticker,
-    asset_type: sellingHolding.asset_type,
-    quantity: sellQuantity,
-    buy_price: sellingHolding.buy_price,
-    buy_currency: sellingHolding.buy_currency,
-    buy_date: sellingHolding.buy_date,
-    sell_price: sellPrice,
-    sell_currency: sellCurrency,
-    sell_date: sellDate,
-    base_currency: BASE_CURRENCY,
-    realized_gain_abs: realizedGainAbs,
-    realized_gain_pct: realizedGainPct,
+    const { error: insertError } = await sb.from("realized_gains").insert({
+      user_id: currentUserId,
+      ticker: sellingHolding.ticker,
+      asset_type: sellingHolding.asset_type,
+      quantity: sellQuantity,
+      buy_price: sellingHolding.buy_price,
+      buy_currency: sellingHolding.buy_currency,
+      buy_date: sellingHolding.buy_date,
+      sell_price: sellPrice,
+      sell_currency: sellCurrency,
+      sell_date: sellDate,
+      base_currency: BASE_CURRENCY,
+      realized_gain_abs: realizedGainAbs,
+      realized_gain_pct: realizedGainPct,
+    });
+    if (insertError) {
+      errEl.textContent = `Could not record sale: ${insertError.message}`;
+      return;
+    }
+
+    // Full sell removes the holding; partial sell just reduces its quantity.
+    if (sellQuantity >= sellingHolding.quantity) {
+      await sb.from("holdings").delete().eq("id", sellingHolding.id);
+    } else {
+      await sb
+        .from("holdings")
+        .update({ quantity: sellingHolding.quantity - sellQuantity })
+        .eq("id", sellingHolding.id);
+    }
+
+    logTransaction({
+      holdingId: sellingHolding.id,
+      portfolioId: sellingHolding.portfolio_id,
+      ticker: sellingHolding.ticker,
+      eventType: "sell",
+      quantity: sellQuantity,
+      price: sellPrice,
+      currency: sellCurrency,
+      eventDate: sellDate,
+      notes:
+        realizedGainAbs != null
+          ? `Realized ${realizedGainAbs >= 0 ? "gain" : "loss"} of ${fmtMoney(realizedGainAbs)} (${fmtPct(realizedGainPct)}).`
+          : null,
+    });
+
+    stopSell();
+    loadHoldings();
+    loadRealizedGains();
+    loadTransactions();
   });
-  if (insertError) {
-    errEl.textContent = `Could not record sale: ${insertError.message}`;
-    return;
-  }
-
-  // Full sell removes the holding; partial sell just reduces its quantity.
-  if (sellQuantity >= sellingHolding.quantity) {
-    await sb.from("holdings").delete().eq("id", sellingHolding.id);
-  } else {
-    await sb
-      .from("holdings")
-      .update({ quantity: sellingHolding.quantity - sellQuantity })
-      .eq("id", sellingHolding.id);
-  }
-
-  logTransaction({
-    holdingId: sellingHolding.id,
-    portfolioId: sellingHolding.portfolio_id,
-    ticker: sellingHolding.ticker,
-    eventType: "sell",
-    quantity: sellQuantity,
-    price: sellPrice,
-    currency: sellCurrency,
-    eventDate: sellDate,
-    notes:
-      realizedGainAbs != null
-        ? `Realized ${realizedGainAbs >= 0 ? "gain" : "loss"} of ${fmtMoney(realizedGainAbs)} (${fmtPct(realizedGainPct)}).`
-        : null,
-  });
-
-  stopSell();
-  loadHoldings();
-  loadRealizedGains();
-  loadTransactions();
 });
 
 // Day 11-style "Could" addition: a record of every closed position, not just
@@ -1275,28 +1714,102 @@ async function loadTransactions() {
     .limit(200);
 
   if (error) {
-    tbody.innerHTML = `<tr><td colspan="6">Could not load transaction history: ${error.message}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="7">Could not load transaction history: ${error.message}</td></tr>`;
     return;
   }
   lastTransactionRows = data || [];
   if (!data || data.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="6">No recorded activity yet — every buy, edit, sell, delete, and import will show up here.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="7">No recorded activity yet — every buy, edit, sell, delete, and import will show up here.</td></tr>`;
     return;
   }
 
+  // Day 25 ("Undo for delete"): the asset_type tag stashed in a delete
+  // event's notes (see the del-btn handler) is machine-readable, not meant
+  // for the human-facing ledger — strip it before display.
+  const ASSET_TYPE_TAG_RE = /\s*\[asset_type:(\w+)\]/;
+
   tbody.innerHTML = data
-    .map(
-      (r) => `
+    .map((r) => {
+      const tagMatch = r.notes?.match(ASSET_TYPE_TAG_RE);
+      const displayNotes = r.notes ? r.notes.replace(ASSET_TYPE_TAG_RE, "") : "—";
+      const canRestore = r.event_type === "delete";
+      return `
     <tr>
       <td>${new Date(r.event_date).toLocaleDateString()}</td>
       <td><span class="event-tag event-tag-${escapeHtml(r.event_type)}">${escapeHtml(EVENT_TYPE_LABELS[r.event_type] || r.event_type)}</span></td>
       <td>${escapeHtml(r.ticker)}</td>
       <td>${r.quantity ?? "—"}</td>
       <td>${r.price != null && r.currency ? fmtMoneyIn(r.price, r.currency) : "—"}</td>
-      <td>${r.notes ? escapeHtml(r.notes) : "—"}</td>
-    </tr>`
-    )
+      <td>${escapeHtml(displayNotes) || "—"}</td>
+      <td>${
+        canRestore
+          ? `<button type="button" class="restore-btn" data-id="${r.id}" data-ticker="${escapeHtml(r.ticker)}" data-quantity="${r.quantity ?? ""}" data-price="${r.price ?? ""}" data-currency="${escapeHtml(r.currency || "")}" data-date="${r.event_date}" data-portfolio="${r.portfolio_id || ""}" data-asset-type="${tagMatch ? escapeHtml(tagMatch[1]) : "stock"}" aria-label="Restore deleted ${escapeHtml(r.ticker)}">Restore</button>`
+          : ""
+      }</td>
+    </tr>`;
+    })
     .join("");
+
+  tbody.querySelectorAll(".restore-btn").forEach((btn) => btn.addEventListener("click", () => restoreDeletedHolding(btn.dataset)));
+}
+
+// Day 25 ("Undo for delete"): reconstructs a holding row from a delete-type
+// transaction's stashed fields, then runs it through the SAME merge-or-insert
+// path as adding a holding normally (so restoring into a portfolio/currency
+// that already holds this ticker merges correctly instead of creating a
+// stray duplicate). Client-side only guard against double-restoring the same
+// row twice in one page view — disables the button immediately on click;
+// a genuine double-restore after a reload would just add the position twice,
+// same as manually re-adding it, recoverable by deleting once more.
+async function restoreDeletedHolding(data) {
+  if (!currentUserId) return;
+  const btn = document.querySelector(`.restore-btn[data-id="${data.id}"]`);
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Restoring…";
+  }
+  const payload = {
+    ticker: data.ticker,
+    asset_type: ["stock", "etf", "fund"].includes(data.assetType) ? data.assetType : "stock",
+    quantity: Number(data.quantity),
+    buy_price: Number(data.price),
+    buy_currency: data.currency || BASE_CURRENCY,
+    buy_date: data.date,
+    portfolio_id: data.portfolio || null,
+  };
+  if (!(payload.quantity > 0) || !(payload.buy_price > 0)) {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "Restore";
+    }
+    return;
+  }
+
+  const sameTicker = await findSameTickerHoldings(payload.ticker, payload.portfolio_id, null);
+  const existing = sameTicker.find((h) => h.buy_currency === payload.buy_currency);
+  if (existing) {
+    const merged = weightedMerge(existing, payload);
+    await sb.from("holdings").update(merged).eq("id", existing.id);
+  } else {
+    payload.user_id = currentUserId;
+    await sb.from("holdings").insert(payload);
+  }
+
+  logTransaction({
+    portfolioId: payload.portfolio_id,
+    ticker: payload.ticker,
+    eventType: "buy",
+    quantity: payload.quantity,
+    price: payload.buy_price,
+    currency: payload.buy_currency,
+    eventDate: payload.buy_date,
+    notes: "Restored after being deleted.",
+  });
+
+  await loadHoldings();
+  loadTransactions();
+  await triggerPriceRefresh();
+  loadHoldings();
 }
 
 // --- CSV export --------------------------------------------------------
@@ -1668,7 +2181,14 @@ let allPortfolios = [];
 let selectedPortfolioId = "__all__";
 
 async function loadPortfolios() {
-  const { data, error } = await sb.from("portfolios").select("*").order("created_at");
+  // Day 26 ("view-only sharing"): explicit user_id filter — without it, if
+  // anyone has shared a portfolio with you, RLS's additive "shared viewers
+  // can read shared portfolios" policy would mix THEIR portfolio names into
+  // YOUR OWN filter dropdown/add-holding form. This list is always your own
+  // portfolios; a shared owner's portfolio names are looked up separately
+  // (see viewSharedPortfolio / sharedOwnerPortfolioNameById) and never go
+  // through this function or the `allPortfolios` global.
+  const { data, error } = await sb.from("portfolios").select("*").eq("user_id", currentUserId).order("created_at");
   if (error) {
     console.warn("Could not load portfolios:", error.message);
     return;
@@ -1688,6 +2208,16 @@ async function loadPortfolios() {
   formSelect.innerHTML =
     `<option value="">No portfolio</option>` + allPortfolios.map((p) => `<option value="${p.id}">${escapeHtml(p.name)}</option>`).join("");
   setPortfolioFormDefault();
+
+  // Day 26 ("view-only sharing") — lets you scope an invite to one specific
+  // portfolio instead of always sharing everything.
+  const shareSelect = document.getElementById("sharePortfolioSelect");
+  if (shareSelect) {
+    const keepShareSelection = shareSelect.value;
+    shareSelect.innerHTML =
+      `<option value="">All portfolios</option>` + allPortfolios.map((p) => `<option value="${p.id}">${escapeHtml(p.name)}</option>`).join("");
+    if (allPortfolios.some((p) => p.id === keepShareSelection)) shareSelect.value = keepShareSelection;
+  }
 
   updatePortfolioBarButtons();
 }
@@ -2001,7 +2531,11 @@ document.getElementById("fetchPricesBtn").addEventListener("click", async () => 
 // elsewhere) — a currency mismatch is added/kept as its own row instead,
 // with a status message explaining why.
 async function findSameTickerHoldings(ticker, portfolioId, excludeId) {
-  let q = sb.from("holdings").select("*").eq("ticker", ticker);
+  // Day 26 ("view-only sharing"): explicit user_id filter, not just RLS —
+  // now that a shared viewer's SELECT policy can return ANOTHER account's
+  // holdings too, an unfiltered query here would let someone else's shared
+  // tickers wrongly count as "you already own this" duplicates.
+  let q = sb.from("holdings").select("*").eq("ticker", ticker).eq("user_id", currentUserId);
   q = portfolioId ? q.eq("portfolio_id", portfolioId) : q.is("portfolio_id", null);
   if (excludeId) q = q.neq("id", excludeId);
   const { data, error } = await q;
@@ -2039,33 +2573,56 @@ document.getElementById("holdingForm").addEventListener("submit", async (e) => {
     buy_currency: form.get("buy_currency"),
     buy_date: form.get("buy_date"),
     portfolio_id: form.get("portfolio_id") || null,
+    notes: form.get("notes")?.trim() || null,
   };
   if (!payload.ticker) return (errEl.textContent = "Ticker is required.");
   if (!(payload.quantity > 0)) return (errEl.textContent = "Quantity must be positive.");
   if (!(payload.buy_price > 0)) return (errEl.textContent = "Buy price must be positive.");
 
-  if (editingHoldingId) {
-    const before = window.__holdingsById?.[editingHoldingId] || null;
-    const sameTicker = await findSameTickerHoldings(payload.ticker, payload.portfolio_id, editingHoldingId);
-    const collision = sameTicker.find((h) => h.buy_currency === payload.buy_currency);
+  await withButtonLoading(document.getElementById("formSubmitBtn"), editingHoldingId ? "Saving…" : "Adding…", async () => {
+    if (editingHoldingId) {
+      const before = window.__holdingsById?.[editingHoldingId] || null;
+      const sameTicker = await findSameTickerHoldings(payload.ticker, payload.portfolio_id, editingHoldingId);
+      const collision = sameTicker.find((h) => h.buy_currency === payload.buy_currency);
 
-    if (collision) {
-      // The edit now matches another existing row exactly (ticker +
-      // portfolio + currency) — merge into that row and remove this one,
-      // rather than leaving two rows for the same position.
-      const merged = weightedMerge(collision, payload);
-      const { error: mergeError } = await sb.from("holdings").update(merged).eq("id", collision.id);
-      if (mergeError) {
-        errEl.textContent = `Could not merge: ${mergeError.message}`;
-        return;
-      }
-      const { error: delError } = await sb.from("holdings").delete().eq("id", editingHoldingId);
-      if (delError) {
-        errEl.textContent = `Merged, but could not remove the old duplicate row: ${delError.message}`;
+      if (collision) {
+        // The edit now matches another existing row exactly (ticker +
+        // portfolio + currency) — merge into that row and remove this one,
+        // rather than leaving two rows for the same position.
+        const merged = weightedMerge(collision, payload);
+        const { error: mergeError } = await sb.from("holdings").update(merged).eq("id", collision.id);
+        if (mergeError) {
+          errEl.textContent = `Could not merge: ${mergeError.message}`;
+          return;
+        }
+        const { error: delError } = await sb.from("holdings").delete().eq("id", editingHoldingId);
+        if (delError) {
+          errEl.textContent = `Merged, but could not remove the old duplicate row: ${delError.message}`;
+        } else {
+          statusEl.textContent = `Merged into your existing ${payload.ticker} position — now ${merged.quantity} @ weighted avg ${fmtMoneyIn(merged.buy_price, payload.buy_currency)}.`;
+          logTransaction({
+            holdingId: collision.id,
+            portfolioId: payload.portfolio_id,
+            ticker: payload.ticker,
+            eventType: "edit",
+            quantity: payload.quantity,
+            price: payload.buy_price,
+            currency: payload.buy_currency,
+            eventDate: payload.buy_date,
+            notes: `Edited and merged into an existing lot — now ${merged.quantity} @ weighted avg ${fmtMoneyIn(merged.buy_price, payload.buy_currency)}.`,
+          });
+        }
       } else {
-        statusEl.textContent = `Merged into your existing ${payload.ticker} position — now ${merged.quantity} @ weighted avg ${fmtMoneyIn(merged.buy_price, payload.buy_currency)}.`;
+        const { error } = await sb.from("holdings").update(payload).eq("id", editingHoldingId);
+        if (error) {
+          errEl.textContent = `Could not save changes: ${error.message}`;
+          return;
+        }
+        if (sameTicker.length) {
+          statusEl.textContent = `Saved as its own row — an existing ${payload.ticker} holding in this portfolio is in ${sameTicker[0].buy_currency}, so it wasn't merged.`;
+        }
         logTransaction({
-          holdingId: collision.id,
+          holdingId: editingHoldingId,
           portfolioId: payload.portfolio_id,
           ticker: payload.ticker,
           eventType: "edit",
@@ -2073,94 +2630,76 @@ document.getElementById("holdingForm").addEventListener("submit", async (e) => {
           price: payload.buy_price,
           currency: payload.buy_currency,
           eventDate: payload.buy_date,
-          notes: `Edited and merged into an existing lot — now ${merged.quantity} @ weighted avg ${fmtMoneyIn(merged.buy_price, payload.buy_currency)}.`,
+          notes: before
+            ? `Changed from ${before.quantity} @ ${fmtMoneyIn(before.buy_price, before.buy_currency)} (${before.buy_date}) to ${payload.quantity} @ ${fmtMoneyIn(payload.buy_price, payload.buy_currency)} (${payload.buy_date}).`
+            : null,
         });
       }
-    } else {
-      const { error } = await sb.from("holdings").update(payload).eq("id", editingHoldingId);
+      stopEdit();
+      e.target.reset();
+      holdingFormDirty = false;
+      setDateToToday();
+      setPortfolioFormDefault();
+      loadHoldings();
+      loadTransactions();
+      await triggerPriceRefresh(); // ticker may have changed
+      loadHoldings();
+      return;
+    }
+
+    payload.user_id = currentUserId; // required by RLS: with check (auth.uid() = user_id)
+
+    const sameTicker = await findSameTickerHoldings(payload.ticker, payload.portfolio_id, null);
+    const existing = sameTicker.find((h) => h.buy_currency === payload.buy_currency);
+
+    if (existing) {
+      const merged = weightedMerge(existing, payload);
+      const { error } = await sb.from("holdings").update(merged).eq("id", existing.id);
       if (error) {
-        errEl.textContent = `Could not save changes: ${error.message}`;
+        errEl.textContent = `Could not merge into existing holding: ${error.message}`;
         return;
       }
-      if (sameTicker.length) {
-        statusEl.textContent = `Saved as its own row — an existing ${payload.ticker} holding in this portfolio is in ${sameTicker[0].buy_currency}, so it wasn't merged.`;
-      }
+      statusEl.textContent = `Merged into your existing ${payload.ticker} position — now ${merged.quantity} @ weighted avg ${fmtMoneyIn(merged.buy_price, payload.buy_currency)}.`;
       logTransaction({
-        holdingId: editingHoldingId,
+        holdingId: existing.id,
         portfolioId: payload.portfolio_id,
         ticker: payload.ticker,
-        eventType: "edit",
+        eventType: "buy",
         quantity: payload.quantity,
         price: payload.buy_price,
         currency: payload.buy_currency,
         eventDate: payload.buy_date,
-        notes: before
-          ? `Changed from ${before.quantity} @ ${fmtMoneyIn(before.buy_price, before.buy_currency)} (${before.buy_date}) to ${payload.quantity} @ ${fmtMoneyIn(payload.buy_price, payload.buy_currency)} (${payload.buy_date}).`
-          : null,
+        notes: `Merged into an existing lot — now ${merged.quantity} @ weighted avg ${fmtMoneyIn(merged.buy_price, payload.buy_currency)}.`,
+      });
+    } else {
+      const { error } = await sb.from("holdings").insert(payload);
+      if (error) {
+        errEl.textContent = `Could not save: ${error.message}`;
+        return;
+      }
+      if (sameTicker.length) {
+        statusEl.textContent = `Added as its own row — an existing ${payload.ticker} holding in this portfolio is in ${sameTicker[0].buy_currency}, so it wasn't merged.`;
+      }
+      logTransaction({
+        portfolioId: payload.portfolio_id,
+        ticker: payload.ticker,
+        eventType: "buy",
+        quantity: payload.quantity,
+        price: payload.buy_price,
+        currency: payload.buy_currency,
+        eventDate: payload.buy_date,
       });
     }
-    stopEdit();
+
     e.target.reset();
-    setDateToToday();
-    setPortfolioFormDefault();
-    loadHoldings();
+    holdingFormDirty = false;
+    setDateToToday(); // form.reset() clears the date field back to blank — refill it
+    setPortfolioFormDefault(); // form.reset() also clears this back to "No portfolio" — refill from the active filter
+    loadHoldings(); // show the new/merged row immediately (price will say "no data" until the refresh below lands)
     loadTransactions();
-    await triggerPriceRefresh(); // ticker may have changed
-    loadHoldings();
-    return;
-  }
-
-  payload.user_id = currentUserId; // required by RLS: with check (auth.uid() = user_id)
-
-  const sameTicker = await findSameTickerHoldings(payload.ticker, payload.portfolio_id, null);
-  const existing = sameTicker.find((h) => h.buy_currency === payload.buy_currency);
-
-  if (existing) {
-    const merged = weightedMerge(existing, payload);
-    const { error } = await sb.from("holdings").update(merged).eq("id", existing.id);
-    if (error) {
-      errEl.textContent = `Could not merge into existing holding: ${error.message}`;
-      return;
-    }
-    statusEl.textContent = `Merged into your existing ${payload.ticker} position — now ${merged.quantity} @ weighted avg ${fmtMoneyIn(merged.buy_price, payload.buy_currency)}.`;
-    logTransaction({
-      holdingId: existing.id,
-      portfolioId: payload.portfolio_id,
-      ticker: payload.ticker,
-      eventType: "buy",
-      quantity: payload.quantity,
-      price: payload.buy_price,
-      currency: payload.buy_currency,
-      eventDate: payload.buy_date,
-      notes: `Merged into an existing lot — now ${merged.quantity} @ weighted avg ${fmtMoneyIn(merged.buy_price, payload.buy_currency)}.`,
-    });
-  } else {
-    const { error } = await sb.from("holdings").insert(payload);
-    if (error) {
-      errEl.textContent = `Could not save: ${error.message}`;
-      return;
-    }
-    if (sameTicker.length) {
-      statusEl.textContent = `Added as its own row — an existing ${payload.ticker} holding in this portfolio is in ${sameTicker[0].buy_currency}, so it wasn't merged.`;
-    }
-    logTransaction({
-      portfolioId: payload.portfolio_id,
-      ticker: payload.ticker,
-      eventType: "buy",
-      quantity: payload.quantity,
-      price: payload.buy_price,
-      currency: payload.buy_currency,
-      eventDate: payload.buy_date,
-    });
-  }
-
-  e.target.reset();
-  setDateToToday(); // form.reset() clears the date field back to blank — refill it
-  setPortfolioFormDefault(); // form.reset() also clears this back to "No portfolio" — refill from the active filter
-  loadHoldings(); // show the new/merged row immediately (price will say "no data" until the refresh below lands)
-  loadTransactions();
-  await triggerPriceRefresh();
-  loadHoldings(); // reload once the Worker has cached a price for the new ticker
+    await triggerPriceRefresh();
+    loadHoldings(); // reload once the Worker has cached a price for the new ticker
+  });
 });
 
 // Default the buy-date field to today so adding a holding usually needs zero
@@ -2170,6 +2709,495 @@ function setDateToToday() {
   const input = document.getElementById("buyDateInput");
   if (input) input.value = new Date().toISOString().slice(0, 10);
 }
+
+// ── Day 26: Watchlist ────────────────────────────────────────────────────
+// Tickers you don't own — separate table (schema.sql), never touches
+// quantity/cost-basis math. Prices come from the same shared `prices` cache
+// the holdings table reads (fetchLatestPrices, defined near the top of this
+// file), just displayed in the ticker's own trading currency rather than
+// converted to base — there's no quantity here to make a base-currency total
+// meaningful.
+async function loadWatchlist() {
+  const tbody = document.getElementById("watchlistBody");
+  const { data, error } = await sb.from("watchlist").select("*").order("created_at");
+  if (error) {
+    tbody.innerHTML = `<tr><td colspan="5">Failed to load watchlist: ${escapeHtml(error.message)}</td></tr>`;
+    return;
+  }
+  if (!data.length) {
+    tbody.innerHTML = `<tr><td colspan="5">Nothing on your watchlist yet.</td></tr>`;
+    return;
+  }
+  const tickers = [...new Set(data.map((w) => w.ticker))];
+  const prices = await fetchLatestPrices(tickers).catch(() => ({}));
+  tbody.innerHTML = data
+    .map((w) => {
+      const p = prices[w.ticker];
+      const dayPct = p && p.price != null && p.previous_close ? ((p.price - p.previous_close) / p.previous_close) * 100 : null;
+      return `<tr>
+        <td data-label="Ticker">${escapeHtml(w.ticker)}</td>
+        <td data-label="Price">${p && p.price != null ? fmtMoneyIn(p.price, p.currency || "") : "—"}</td>
+        <td data-label="Day %" class="${pctClass(dayPct)}">${fmtPct(dayPct)}</td>
+        <td data-label="Notes">${escapeHtml(w.notes || "")}</td>
+        <td data-label="Actions"><button type="button" class="del-btn watchlist-del-btn" data-id="${w.id}" aria-label="Remove ${escapeHtml(w.ticker)} from watchlist">Remove</button></td>
+      </tr>`;
+    })
+    .join("");
+  tbody.querySelectorAll(".watchlist-del-btn").forEach((btn) =>
+    btn.addEventListener("click", async () => {
+      await sb.from("watchlist").delete().eq("id", btn.dataset.id);
+      loadWatchlist();
+    })
+  );
+}
+
+document.getElementById("watchlistForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const errEl = document.getElementById("watchlistError");
+  errEl.textContent = "";
+  if (!currentUserId) {
+    errEl.textContent = "Not signed in — please sign in again.";
+    return;
+  }
+  const form = new FormData(e.target);
+  const ticker = form.get("ticker").trim().toUpperCase();
+  const notes = form.get("notes")?.trim() || null;
+  if (!ticker) {
+    errEl.textContent = "Ticker is required.";
+    return;
+  }
+  await withButtonLoading(document.getElementById("watchlistSubmitBtn"), "Adding…", async () => {
+    const { error } = await sb.from("watchlist").insert({ user_id: currentUserId, ticker, notes });
+    if (error) {
+      // idx_watchlist_user_ticker (schema.sql) — same ticker added twice.
+      errEl.textContent = error.message.includes("duplicate") ? `${ticker} is already on your watchlist.` : error.message;
+      return;
+    }
+    e.target.reset();
+    loadWatchlist();
+    triggerPriceRefresh(); // make sure a brand-new ticker gets a price cached soon
+  });
+});
+
+// ── Day 26: Price alerts ─────────────────────────────────────────────────
+// Checked once per scheduled/manual Worker run (see worker/src/index.js
+// processUserDailyJob), NOT continuously — this section just manages the
+// list of thresholds and shows whether/when each one fired.
+async function loadPriceAlerts() {
+  const tbody = document.getElementById("priceAlertsBody");
+  const { data, error } = await sb.from("price_alerts").select("*").order("created_at", { ascending: false });
+  if (error) {
+    tbody.innerHTML = `<tr><td colspan="5">Failed to load alerts: ${escapeHtml(error.message)}</td></tr>`;
+    return;
+  }
+  if (!data.length) {
+    tbody.innerHTML = `<tr><td colspan="5">No price alerts set yet.</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = data
+    .map((a) => {
+      const status = a.active
+        ? "Active"
+        : a.triggered_at
+          ? `Triggered ${new Date(a.triggered_at).toLocaleDateString()} at ${a.triggered_price}`
+          : "Inactive";
+      return `<tr>
+        <td data-label="Ticker">${escapeHtml(a.ticker)}</td>
+        <td data-label="Condition">${a.condition === "above" ? "Rises above" : "Falls below"}</td>
+        <td data-label="Target">${a.target_price}</td>
+        <td data-label="Status">${escapeHtml(status)}</td>
+        <td data-label="Actions"><button type="button" class="del-btn alert-del-btn" data-id="${a.id}" aria-label="Delete alert for ${escapeHtml(a.ticker)}">Delete</button></td>
+      </tr>`;
+    })
+    .join("");
+  tbody.querySelectorAll(".alert-del-btn").forEach((btn) =>
+    btn.addEventListener("click", async () => {
+      await sb.from("price_alerts").delete().eq("id", btn.dataset.id);
+      loadPriceAlerts();
+    })
+  );
+}
+
+document.getElementById("priceAlertForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const errEl = document.getElementById("priceAlertError");
+  errEl.textContent = "";
+  if (!currentUserId) {
+    errEl.textContent = "Not signed in — please sign in again.";
+    return;
+  }
+  const form = new FormData(e.target);
+  const ticker = form.get("ticker").trim().toUpperCase();
+  const condition = form.get("condition");
+  const targetPrice = Number(form.get("target_price"));
+  if (!ticker) {
+    errEl.textContent = "Ticker is required.";
+    return;
+  }
+  if (!(targetPrice > 0)) {
+    errEl.textContent = "Target price must be positive.";
+    return;
+  }
+  await withButtonLoading(document.getElementById("priceAlertSubmitBtn"), "Setting…", async () => {
+    const { error } = await sb.from("price_alerts").insert({ user_id: currentUserId, ticker, condition, target_price: targetPrice });
+    if (error) {
+      errEl.textContent = error.message;
+      return;
+    }
+    e.target.reset();
+    loadPriceAlerts();
+  });
+});
+
+// ── Day 26: Dividend log ─────────────────────────────────────────────────
+// Manual entry — see schema.sql's dividends comment for why (no free
+// dividends data source is wired up). Purely informational: doesn't feed
+// into any gain/loss math elsewhere in the app.
+async function loadDividends() {
+  const tbody = document.getElementById("dividendsBody");
+  const totalHint = document.getElementById("dividendTotalHint");
+  const { data, error } = await sb.from("dividends").select("*").order("pay_date", { ascending: false });
+  if (error) {
+    tbody.innerHTML = `<tr><td colspan="5">Failed to load dividends: ${escapeHtml(error.message)}</td></tr>`;
+    totalHint.textContent = "";
+    return;
+  }
+  if (!data.length) {
+    tbody.innerHTML = `<tr><td colspan="5">No dividends logged yet.</td></tr>`;
+    totalHint.textContent = "";
+    return;
+  }
+  // Summed per currency rather than converted to one total — converting
+  // would need an FX rate per dividend's pay_date, which this feature
+  // doesn't fetch (same "keep it simple, manual entry" scope as the rest of
+  // this table).
+  const totalsByCurrency = {};
+  for (const d of data) totalsByCurrency[d.currency] = (totalsByCurrency[d.currency] || 0) + d.amount;
+  totalHint.textContent = `Total received: ${Object.entries(totalsByCurrency)
+    .map(([ccy, amt]) => fmtMoneyIn(amt, ccy))
+    .join(" + ")}`;
+  tbody.innerHTML = data
+    .map(
+      (d) => `<tr>
+        <td data-label="Date">${d.pay_date}</td>
+        <td data-label="Ticker">${escapeHtml(d.ticker)}</td>
+        <td data-label="Amount">${fmtMoneyIn(d.amount, d.currency)}</td>
+        <td data-label="Notes">${escapeHtml(d.notes || "")}</td>
+        <td data-label="Actions"><button type="button" class="del-btn dividend-del-btn" data-id="${d.id}" aria-label="Delete dividend entry for ${escapeHtml(d.ticker)} on ${d.pay_date}">Delete</button></td>
+      </tr>`
+    )
+    .join("");
+  tbody.querySelectorAll(".dividend-del-btn").forEach((btn) =>
+    btn.addEventListener("click", async () => {
+      await sb.from("dividends").delete().eq("id", btn.dataset.id);
+      loadDividends();
+    })
+  );
+}
+
+document.getElementById("dividendForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const errEl = document.getElementById("dividendError");
+  errEl.textContent = "";
+  if (!currentUserId) {
+    errEl.textContent = "Not signed in — please sign in again.";
+    return;
+  }
+  const form = new FormData(e.target);
+  const ticker = form.get("ticker").trim().toUpperCase();
+  const amount = Number(form.get("amount"));
+  const currency = form.get("currency");
+  const payDate = form.get("pay_date");
+  const notes = form.get("notes")?.trim() || null;
+  if (!ticker) {
+    errEl.textContent = "Ticker is required.";
+    return;
+  }
+  if (!(amount > 0)) {
+    errEl.textContent = "Amount must be positive.";
+    return;
+  }
+  if (!payDate) {
+    errEl.textContent = "Pay date is required.";
+    return;
+  }
+  await withButtonLoading(document.getElementById("dividendSubmitBtn"), "Logging…", async () => {
+    const { error } = await sb.from("dividends").insert({ user_id: currentUserId, ticker, amount, currency, pay_date: payDate, notes });
+    if (error) {
+      errEl.textContent = error.message;
+      return;
+    }
+    e.target.reset();
+    document.getElementById("dividendDateInput").value = new Date().toISOString().slice(0, 10);
+    loadDividends();
+  });
+});
+
+// ── Day 26: Target allocation + rebalancing hints ───────────────────────
+// "Current %" is read from lastHoldingsRows/lastHoldingsTotalValue — the
+// SAME already-computed, portfolio-filter-aware rows the holdings table and
+// Allocation section use — so this respects whatever portfolio filter is
+// currently selected without a separate query.
+async function loadTargetAllocations() {
+  const tbody = document.getElementById("targetAllocationBody");
+  const { data, error } = await sb.from("target_allocations").select("*").order("created_at");
+  if (error) {
+    tbody.innerHTML = `<tr><td colspan="5">Failed to load targets: ${escapeHtml(error.message)}</td></tr>`;
+    return;
+  }
+  if (!data.length) {
+    tbody.innerHTML = `<tr><td colspan="5">No targets set yet — add one above.</td></tr>`;
+    return;
+  }
+
+  const totalValue = lastHoldingsTotalValue;
+  const currentByAssetType = {};
+  const currentByTicker = {};
+  for (const r of lastHoldingsRows) {
+    if (!r.currentValue || !totalValue) continue;
+    const w = (r.currentValue / totalValue) * 100;
+    currentByAssetType[r.h.asset_type] = (currentByAssetType[r.h.asset_type] || 0) + w;
+    currentByTicker[r.h.ticker] = (currentByTicker[r.h.ticker] || 0) + w;
+  }
+
+  tbody.innerHTML = data
+    .map((t) => {
+      const current = t.key_type === "asset_type" ? currentByAssetType[t.key_value] || 0 : currentByTicker[t.key_value] || 0;
+      const gap = t.target_pct - current;
+      const label = t.key_type === "asset_type" ? `${t.key_value} (asset type)` : t.key_value;
+      return `<tr>
+        <td data-label="Target">${escapeHtml(label)}</td>
+        <td data-label="Target %">${t.target_pct.toFixed(1)}%</td>
+        <td data-label="Current %">${current.toFixed(1)}%</td>
+        <td data-label="Gap" class="${pctClass(gap)}">${gap >= 0 ? "+" : ""}${gap.toFixed(1)}%</td>
+        <td data-label="Actions"><button type="button" class="del-btn target-del-btn" data-id="${t.id}" aria-label="Remove target for ${escapeHtml(label)}">Remove</button></td>
+      </tr>`;
+    })
+    .join("");
+  tbody.querySelectorAll(".target-del-btn").forEach((btn) =>
+    btn.addEventListener("click", async () => {
+      await sb.from("target_allocations").delete().eq("id", btn.dataset.id);
+      loadTargetAllocations();
+    })
+  );
+}
+
+document.getElementById("targetKeyType").addEventListener("change", (e) => {
+  const isTicker = e.target.value === "ticker";
+  document.getElementById("targetKeyValueSelect").style.display = isTicker ? "none" : "";
+  document.getElementById("targetKeyValueTicker").style.display = isTicker ? "" : "none";
+});
+
+document.getElementById("targetAllocationForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const errEl = document.getElementById("targetAllocationError");
+  errEl.textContent = "";
+  if (!currentUserId) {
+    errEl.textContent = "Not signed in — please sign in again.";
+    return;
+  }
+  const form = new FormData(e.target);
+  const keyType = form.get("key_type");
+  const keyValue = keyType === "ticker" ? form.get("key_value_ticker").trim().toUpperCase() : form.get("key_value");
+  const targetPct = Number(form.get("target_pct"));
+  if (!keyValue) {
+    errEl.textContent = "Pick an asset type or enter a ticker.";
+    return;
+  }
+  if (!(targetPct >= 0 && targetPct <= 100)) {
+    errEl.textContent = "Target % must be between 0 and 100.";
+    return;
+  }
+  await withButtonLoading(document.getElementById("targetAllocationSubmitBtn"), "Saving…", async () => {
+    // Upsert-by-key (idx_target_allocations_user_key, schema.sql): setting a
+    // target for the same key twice replaces it rather than duplicating.
+    const { error } = await sb
+      .from("target_allocations")
+      .upsert({ user_id: currentUserId, key_type: keyType, key_value: keyValue, target_pct: targetPct }, { onConflict: "user_id,key_type,key_value" });
+    if (error) {
+      errEl.textContent = error.message;
+      return;
+    }
+    e.target.reset();
+    document.getElementById("targetKeyValueTicker").style.display = "none";
+    document.getElementById("targetKeyValueSelect").style.display = "";
+    loadTargetAllocations();
+  });
+});
+
+// ── Day 26: Multi-account/household view — view-only sharing ───────────
+// Inviting by email needs the invitee's Supabase Auth user id, which the
+// anon key can't resolve on its own — see the Worker's /find-user-by-email
+// route (worker/src/index.js). Everything after that (inserting the
+// portfolio_shares row) is a normal RLS-scoped write, same as everywhere
+// else in this file.
+async function loadSharing() {
+  const grantedBody = document.getElementById("sharesGrantedBody");
+  const receivedBody = document.getElementById("sharesReceivedBody");
+
+  const [{ data: granted, error: grantedErr }, { data: received, error: receivedErr }] = await Promise.all([
+    sb.from("portfolio_shares").select("*").eq("owner_user_id", currentUserId).order("created_at"),
+    sb.from("portfolio_shares").select("*").neq("owner_user_id", currentUserId).order("created_at"),
+  ]);
+
+  const scopeLabel = (share) => (share.portfolio_id ? allPortfolios.find((p) => p.id === share.portfolio_id)?.name || "One portfolio" : "All portfolios");
+
+  if (grantedErr) {
+    grantedBody.innerHTML = `<tr><td colspan="3">Failed to load: ${escapeHtml(grantedErr.message)}</td></tr>`;
+  } else if (!granted.length) {
+    grantedBody.innerHTML = `<tr><td colspan="3">You haven't shared your portfolio with anyone.</td></tr>`;
+  } else {
+    grantedBody.innerHTML = granted
+      .map(
+        (s) => `<tr>
+          <td data-label="Email">${escapeHtml(s.shared_with_email)}</td>
+          <td data-label="Scope">${escapeHtml(scopeLabel(s))}</td>
+          <td data-label="Actions"><button type="button" class="del-btn share-revoke-btn" data-id="${s.id}" aria-label="Revoke access for ${escapeHtml(s.shared_with_email)}">Revoke</button></td>
+        </tr>`
+      )
+      .join("");
+    grantedBody.querySelectorAll(".share-revoke-btn").forEach((btn) =>
+      btn.addEventListener("click", async () => {
+        await sb.from("portfolio_shares").delete().eq("id", btn.dataset.id);
+        loadSharing();
+      })
+    );
+  }
+
+  if (receivedErr) {
+    receivedBody.innerHTML = `<tr><td colspan="3">Failed to load: ${escapeHtml(receivedErr.message)}</td></tr>`;
+  } else if (!received.length) {
+    receivedBody.innerHTML = `<tr><td colspan="3">No one has shared a portfolio with you.</td></tr>`;
+  } else {
+    receivedBody.innerHTML = received
+      .map(
+        (s) => `<tr>
+          <td data-label="Owner">${escapeHtml(s.owner_email || s.owner_user_id)}</td>
+          <td data-label="Scope">${escapeHtml(scopeLabel(s))}</td>
+          <td data-label="Actions">
+            <button type="button" class="view-shared-btn" data-owner="${s.owner_user_id}" data-portfolio="${s.portfolio_id || ""}" data-label="${escapeHtml(s.owner_email || "")}">View</button>
+            <button type="button" class="del-btn share-leave-btn" data-id="${s.id}" aria-label="Stop viewing ${escapeHtml(s.owner_email || "this")}'s portfolio">Leave</button>
+          </td>
+        </tr>`
+      )
+      .join("");
+    receivedBody.querySelectorAll(".share-leave-btn").forEach((btn) =>
+      btn.addEventListener("click", async () => {
+        await sb.from("portfolio_shares").delete().eq("id", btn.dataset.id);
+        loadSharing();
+      })
+    );
+    receivedBody.querySelectorAll(".view-shared-btn").forEach((btn) =>
+      btn.addEventListener("click", () => viewSharedPortfolio(btn.dataset.owner, btn.dataset.label))
+    );
+  }
+}
+
+document.getElementById("shareForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const errEl = document.getElementById("shareError");
+  const hintEl = document.getElementById("shareHint");
+  errEl.textContent = "";
+  hintEl.textContent = "";
+  if (!currentUserId) {
+    errEl.textContent = "Not signed in — please sign in again.";
+    return;
+  }
+  if (!window.WORKER_URL) {
+    errEl.textContent = "Can't reach the Worker (WORKER_URL not configured) — can't resolve that email to an account.";
+    return;
+  }
+  const form = new FormData(e.target);
+  const email = form.get("email").trim();
+  const portfolioId = form.get("portfolio_id") || null;
+  if (!email) {
+    errEl.textContent = "Enter an email address.";
+    return;
+  }
+  await withButtonLoading(document.getElementById("shareSubmitBtn"), "Sharing…", async () => {
+    let lookup;
+    try {
+      const res = await authedFetch(`${window.WORKER_URL}/find-user-by-email?email=${encodeURIComponent(email)}`);
+      lookup = await res.json();
+      if (!res.ok) throw new Error(lookup.error || `HTTP ${res.status}`);
+    } catch (err) {
+      errEl.textContent = `Could not look up that email: ${err.message}`;
+      return;
+    }
+    if (!lookup.found) {
+      errEl.textContent = `No Portfolio Tracker account found for ${email} — they need to sign up first.`;
+      return;
+    }
+    if (lookup.id === currentUserId) {
+      errEl.textContent = "You can't share your portfolio with yourself.";
+      return;
+    }
+    const { error } = await sb.from("portfolio_shares").insert({
+      owner_user_id: currentUserId,
+      shared_with_user_id: lookup.id,
+      shared_with_email: lookup.email,
+      owner_email: currentUserEmail,
+      portfolio_id: portfolioId,
+    });
+    if (error) {
+      errEl.textContent = error.message.includes("duplicate") ? "Already shared with that person at that scope." : error.message;
+      return;
+    }
+    hintEl.textContent = `Shared with ${lookup.email}.`;
+    e.target.reset();
+    loadSharing();
+  });
+});
+
+// Switches the whole dashboard into a read-only view of someone else's
+// shared holdings/value history. Deliberately narrow: it swaps out
+// loadHoldings/loadValueHistory's data source and hides every mutating
+// control (Add Holding, Sell, Edit, Delete, inline editing), rather than
+// building a second parallel UI — the numbers are what's being shared, not
+// a separate app experience.
+let sharedViewOwnerId = null;
+// Day 26 ("view-only sharing"): the owner's OWN portfolio id -> name map,
+// kept entirely separate from `allPortfolios` (which stays your own list at
+// all times — see loadPortfolios). Populated once per viewSharedPortfolio
+// call via the "shared viewers can read shared portfolios" RLS policy.
+let sharedOwnerPortfolioNameById = {};
+// Remembers your own filter selection from before you switched into shared
+// view, so exiting restores it instead of silently leaving you on "All
+// portfolios" if you had a specific one selected.
+let preSharedViewPortfolioId = null;
+
+async function viewSharedPortfolio(ownerId, ownerLabel) {
+  sharedViewOwnerId = ownerId;
+  preSharedViewPortfolioId = selectedPortfolioId;
+  // Shared view is always "all of what was shared" — see loadValueHistory's
+  // comment on why per-portfolio filtering isn't offered here.
+  selectedPortfolioId = "__all__";
+
+  const { data: ownerPortfolios, error } = await sb.from("portfolios").select("id, name").eq("user_id", ownerId);
+  sharedOwnerPortfolioNameById = error ? {} : Object.fromEntries((ownerPortfolios || []).map((p) => [p.id, p.name]));
+
+  const banner = document.getElementById("sharedViewBanner");
+  const label = document.getElementById("sharedViewLabel");
+  if (label) label.textContent = `Viewing ${ownerLabel || "a shared portfolio"}'s holdings — read-only.`;
+  if (banner) banner.style.display = "";
+  document.body.classList.add("shared-view-active");
+  await loadHoldings();
+  await loadValueHistory();
+  banner?.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+function exitSharedView() {
+  sharedViewOwnerId = null;
+  sharedOwnerPortfolioNameById = {};
+  selectedPortfolioId = preSharedViewPortfolioId || "__all__";
+  const banner = document.getElementById("sharedViewBanner");
+  if (banner) banner.style.display = "none";
+  document.body.classList.remove("shared-view-active");
+  loadHoldings();
+  loadValueHistory();
+}
+
+document.getElementById("exitSharedViewBtn").addEventListener("click", exitSharedView);
 
 // Ask the Worker to fetch+cache a price for anything missing (like a
 // just-added holding) without waiting for tomorrow's scheduled run. This is
@@ -2207,31 +3235,45 @@ async function triggerPriceRefresh({ silent = true } = {}) {
 // schema.sql), not just this UI toggle — the anon key is public, so a
 // client-side-only gate would be trivial to bypass otherwise.
 let currentUserId = null; // set from whichever auth call succeeds — never re-fetched separately
+let currentUserEmail = null; // Day 26 ("view-only sharing"): needed for portfolio_shares.owner_email
 
 function showApp(user) {
   currentUserId = user.id;
+  currentUserEmail = user.email;
   document.getElementById("loginSection").style.display = "none";
   document.getElementById("forgotPasswordSection").style.display = "none";
   document.getElementById("appContent").style.display = "";
   setDateToToday();
-  loadPortfolios().then(loadHoldings);
+  document.getElementById("dividendDateInput").value = new Date().toISOString().slice(0, 10);
+  // loadTargetAllocations reads lastHoldingsRows/lastHoldingsTotalValue
+  // (set by loadHoldings) for its "Current %" column, so it's chained after
+  // rather than fired off independently like the rest of this batch.
+  loadPortfolios().then(loadHoldings).then(loadTargetAllocations);
   loadValueHistory();
   loadRealizedGains();
   loadTransactions();
+  loadWatchlist();
+  loadPriceAlerts();
+  loadDividends();
+  loadSharing();
   if (!window.__pollingStarted) {
     window.__pollingStarted = true;
     setInterval(() => {
-      loadPortfolios();
-      loadHoldings();
+      loadPortfolios().then(loadHoldings).then(loadTargetAllocations);
       loadValueHistory();
       loadRealizedGains();
       loadTransactions();
+      loadWatchlist();
+      loadPriceAlerts();
+      loadDividends();
+      loadSharing();
     }, 5 * 60 * 1000); // refresh the view every 5 min from cache (not the API)
   }
 }
 
 function showLogin() {
   currentUserId = null;
+  currentUserEmail = null;
   document.getElementById("appContent").style.display = "none";
   document.getElementById("resetPasswordSection").style.display = "none";
   document.getElementById("forgotPasswordSection").style.display = "none";
@@ -2248,6 +3290,7 @@ function showResetPassword() {
   document.getElementById("loginSection").style.display = "none";
   document.getElementById("forgotPasswordSection").style.display = "none";
   document.getElementById("resetPasswordSection").style.display = "";
+  document.querySelector('#resetPasswordForm input[name="password"]')?.focus();
 }
 
 // Day 23 (a11y/UX review): dedicated "forgot password" screen with its own
@@ -2306,6 +3349,25 @@ document.getElementById("toggleSignupBtn").addEventListener("click", () => {
 //    against a script hammering this one browser tab. State is in-memory
 //    only (resets on reload) — see README for what this does and doesn't
 //    cover, including why a full CAPTCHA integration wasn't added here.
+// Day 25 ("Consistent button loading states"): a small helper wrapping a
+// submit button's disabled+text state around an async block, via try/finally
+// so the button is ALWAYS re-enabled — whichever of a handler's several
+// early-return paths ends up firing, a normal success, or a thrown error.
+// Kept generic instead of hand-writing this in every handler since several
+// of them (sign-in, add/edit holding) have multiple branches where it'd be
+// easy to miss re-enabling on one path.
+async function withButtonLoading(btn, loadingText, fn) {
+  const originalText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = loadingText;
+  try {
+    return await fn();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = originalText;
+  }
+}
+
 function sanitizeAuthError(message) {
   const lower = (message || "").toLowerCase();
   if (lower.includes("already registered") || lower.includes("already exists") || lower.includes("user already")) {
@@ -2351,32 +3413,34 @@ document.getElementById("loginForm").addEventListener("submit", async (e) => {
   // use by the time Supabase's client writes the resulting session token.
   localStorage.setItem(REMEMBER_ME_KEY, form.get("remember") ? "true" : "false");
 
-  if (action === "signup") {
-    const { data, error } = await sb.auth.signUp({ email, password });
+  await withButtonLoading(document.getElementById("loginSubmitBtn"), action === "signup" ? "Creating account…" : "Signing in…", async () => {
+    if (action === "signup") {
+      const { data, error } = await sb.auth.signUp({ email, password });
+      if (error) {
+        loginFailureTimestamps.push(Date.now());
+        errEl.textContent = sanitizeAuthError(error.message);
+        return;
+      }
+      if (data.session) {
+        // Email confirmation is off in this project's Auth settings — signed in right away.
+        showApp(data.user);
+      } else {
+        // Email confirmation is on — Supabase created the account but won't issue a
+        // session until the confirmation link is clicked.
+        hintEl.textContent = "Account created — check your email to confirm it, then sign in above.";
+      }
+      return;
+    }
+
+    const { data, error } = await sb.auth.signInWithPassword({ email, password });
     if (error) {
       loginFailureTimestamps.push(Date.now());
       errEl.textContent = sanitizeAuthError(error.message);
       return;
     }
-    if (data.session) {
-      // Email confirmation is off in this project's Auth settings — signed in right away.
-      showApp(data.user);
-    } else {
-      // Email confirmation is on — Supabase created the account but won't issue a
-      // session until the confirmation link is clicked.
-      hintEl.textContent = "Account created — check your email to confirm it, then sign in above.";
-    }
-    return;
-  }
-
-  const { data, error } = await sb.auth.signInWithPassword({ email, password });
-  if (error) {
-    loginFailureTimestamps.push(Date.now());
-    errEl.textContent = sanitizeAuthError(error.message);
-    return;
-  }
-  loginFailureTimestamps = []; // successful sign-in clears the count
-  showApp(data.user);
+    loginFailureTimestamps = []; // successful sign-in clears the count
+    showApp(data.user);
+  });
 });
 
 document.getElementById("signOutBtn").addEventListener("click", async () => {
@@ -2422,22 +3486,25 @@ document.getElementById("forgotPasswordForm").addEventListener("submit", async (
   hintEl.textContent = "";
   if (!showValidationError(e.target, errEl)) return;
 
-  const email = new FormData(e.target).get("email").trim();
-  const { error } = await sb.auth.resetPasswordForEmail(email, {
-    redirectTo: window.location.origin,
+  await withButtonLoading(document.getElementById("forgotSubmitBtn"), "Sending…", async () => {
+    const email = new FormData(e.target).get("email").trim();
+    const { error } = await sb.auth.resetPasswordForEmail(email, {
+      redirectTo: window.location.origin,
+    });
+    // Day 23 (a11y/UX review): neutral confirmation copy regardless of
+    // whether the email matched an account. Supabase's
+    // resetPasswordForEmail doesn't error on an unknown address anyway (it
+    // wouldn't want to be an account-enumeration oracle either), but we
+    // phrase this defensively so the behaviour stays correct even if that
+    // ever changes — no message here should let someone infer whether a
+    // given email has an account.
+    if (error) {
+      // Only network/rate-limit-type failures should reach here in practice.
+      errEl.textContent = sanitizeAuthError(error.message);
+      return;
+    }
+    hintEl.textContent = "If an account exists for that email, we've sent a link to reset your password. Check your inbox.";
   });
-  // Day 23 (a11y/UX review): neutral confirmation copy regardless of whether
-  // the email matched an account. Supabase's resetPasswordForEmail doesn't
-  // error on an unknown address anyway (it wouldn't want to be an account-
-  // enumeration oracle either), but we phrase this defensively so the
-  // behaviour stays correct even if that ever changes — no message here
-  // should let someone infer whether a given email has an account.
-  if (error) {
-    // Only network/rate-limit-type failures should reach here in practice.
-    errEl.textContent = sanitizeAuthError(error.message);
-    return;
-  }
-  hintEl.textContent = "If an account exists for that email, we've sent a link to reset your password. Check your inbox.";
 });
 
 document.getElementById("resetPasswordForm").addEventListener("submit", async (e) => {
@@ -2456,14 +3523,16 @@ document.getElementById("resetPasswordForm").addEventListener("submit", async (e
     return;
   }
 
-  const { data, error } = await sb.auth.updateUser({ password });
-  if (error) {
-    errEl.textContent = error.message;
-    return;
-  }
-  inPasswordRecovery = false;
-  hintEl.textContent = "Password updated — signing you in…";
-  showApp(data.user);
+  await withButtonLoading(document.getElementById("resetSubmitBtn"), "Updating…", async () => {
+    const { data, error } = await sb.auth.updateUser({ password });
+    if (error) {
+      errEl.textContent = error.message;
+      return;
+    }
+    inPasswordRecovery = false;
+    hintEl.textContent = "Password updated — signing you in…";
+    showApp(data.user);
+  });
 });
 
 document.getElementById("cancelResetBtn").addEventListener("click", async () => {

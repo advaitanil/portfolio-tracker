@@ -93,7 +93,19 @@ header {
   flex-wrap: wrap;
   margin-bottom: 16px;
   padding-right: 44px; /* keep the title clear of the fixed theme toggle */
+  /* Day 25 ("Pinned last-synced freshness indicator"): the dashboard has
+     grown a lot of sections (chart, holdings, realized gains, transaction
+     history, account) — pinning the header keeps "Prices as of" (and Sign
+     out) visible the whole way down instead of only at the very top. */
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  background: var(--bg);
+  padding-top: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid transparent;
 }
+header.is-stuck { border-bottom-color: var(--border); box-shadow: var(--shadow-sm); }
 header h1 { flex: 1; }
 h1 { margin: 0 0 4px; font-size: 1.6rem; font-weight: 700; letter-spacing: -0.01em; }
 .asof { color: var(--muted); font-size: 0.85rem; margin: 0; }
@@ -176,6 +188,15 @@ th[data-sort] .sort-arrow { margin-left: 3px; font-size: 0.7rem; }
 .ticker-duplicate-hint { color: var(--muted); font-size: 0.78rem; margin: -6px 0 4px; min-height: 0; }
 .ticker-duplicate-hint:not(:empty) { color: var(--accent); }
 
+/* Day 26 ("Inline quantity/price editing") — a subtle affordance so the
+   quantity/buy-price cells read as clickable without a border/box on every
+   row all the time; the dashed underline only appears on hover/focus. */
+.editable-cell { cursor: pointer; border-radius: 4px; }
+.editable-cell:hover, .editable-cell:focus-visible { background: var(--row-hover, rgba(127, 127, 127, 0.12)); outline: none; box-shadow: inset 0 0 0 1px var(--border); }
+.inline-edit-input { width: 5.5em; font: inherit; padding: 2px 4px; border: 1px solid var(--accent); border-radius: 4px; background: var(--bg); color: var(--text); }
+.inline-edit-input::-webkit-inner-spin-button { opacity: 1; }
+.inline-edit-currency { color: var(--muted); font-size: 0.78rem; margin-left: 4px; }
+
 /* Day 24: transaction ledger event-type tags. */
 .event-tag { font-size: 0.72rem; font-weight: 600; padding: 2px 7px; border-radius: 4px; border: 1px solid var(--border); color: var(--muted); }
 .event-tag-buy { color: var(--green); border-color: var(--green); }
@@ -183,6 +204,32 @@ th[data-sort] .sort-arrow { margin-left: 3px; font-size: 0.7rem; }
 .event-tag-delete { color: var(--red); border-color: var(--red); }
 .event-tag-edit, .event-tag-merge { color: var(--muted); }
 .event-tag-import { color: var(--accent); border-color: var(--accent); }
+.restore-btn { background: transparent; border: 1px solid var(--border); color: var(--muted); cursor: pointer; font-weight: 500; font-size: 0.78rem; padding: 4px 10px; }
+.restore-btn:hover { color: var(--green); border-color: var(--green); }
+.restore-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+
+/* Day 25 ("Loading skeletons"): replaces plain "Loading…" text with a
+   shimmering placeholder bar — less jarring layout shift, feels faster at
+   the same actual speed. Real content always replaces these rows entirely
+   (see loadHoldings/loadRealizedGains/loadTransactions), so there's no
+   cleanup needed once data arrives. */
+.skeleton-bar {
+  display: block;
+  height: 14px;
+  width: 100%;
+  max-width: 320px;
+  border-radius: 4px;
+  background: linear-gradient(90deg, var(--border) 25%, var(--panel) 50%, var(--border) 75%);
+  background-size: 200% 100%;
+  animation: skeleton-shimmer 1.4s ease-in-out infinite;
+}
+@keyframes skeleton-shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .skeleton-bar { animation: none; background: var(--border); }
+}
 
 /* Day 24: Account section (export/delete). */
 .account-action-row {
@@ -211,6 +258,53 @@ footer { margin-top: 40px; color: var(--muted); font-size: 0.75rem; border-top: 
 @media (max-width: 600px) {
   form { flex-direction: column; align-items: stretch; }
   table { font-size: 0.78rem; }
+}
+
+/* Day 26 ("Mobile card layout for holdings table") — below 640px the
+   holdings table stops being a table at all: each row becomes a bordered
+   card, each cell becomes a label/value line (label from data-label, set
+   per-cell in renderHoldingsTable), and the header row (redundant once
+   labels are inline) is hidden. Scoped to #holdingsTable only — Realized
+   Gains and Transaction History keep the ordinary horizontal-scroll table,
+   since neither was in scope for this pass. */
+@media (max-width: 640px) {
+  #holdingsTable, #holdingsTable tbody, #holdingsTable tr, #holdingsTable td {
+    display: block;
+    width: 100%;
+  }
+  #holdingsTable thead { display: none; }
+  #holdingsTable tbody tr {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 4px 12px;
+    margin-bottom: 12px;
+    background: var(--panel);
+  }
+  #holdingsTable tbody tr.skeleton-row { border: none; background: transparent; padding: 0; }
+  #holdingsTable td {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    text-align: right;
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  #holdingsTable td:last-child { border-bottom: none; flex-wrap: wrap; justify-content: flex-end; }
+  #holdingsTable tr > td[colspan] { display: block; text-align: left; border-bottom: none; }
+  #holdingsTable td[data-label]::before {
+    content: attr(data-label);
+    color: var(--muted);
+    font-weight: 600;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    text-align: left;
+    margin-right: 10px;
+    flex-shrink: 0;
+  }
+  #holdingsTable td[data-label="Ticker"] { font-weight: 700; font-size: 1.05rem; }
+  #holdingsTable td.editable-cell { justify-content: flex-end; }
 }
 
 .login-section {
@@ -347,6 +441,7 @@ footer { margin-top: 40px; color: var(--muted); font-size: 0.75rem; border-top: 
 .chart-legend-swatch { display: inline-block; width: 16px; height: 0; border-top-width: 2.5px; border-top-style: solid; }
 .chart-legend-swatch.swatch-value { border-top-color: var(--text); }
 .chart-legend-swatch.swatch-cost { border-top-color: var(--muted); border-top-style: dashed; border-top-width: 1.75px; }
+.chart-legend-swatch.swatch-benchmark { border-top-color: var(--accent); border-top-style: dotted; border-top-width: 1.75px; }
 
 .quick-actions { display: flex; align-items: center; gap: 10px; margin: 4px 0 24px; flex-wrap: wrap; }
 .quick-actions button { font-size: 0.82rem; padding: 7px 14px; }
@@ -432,3 +527,65 @@ footer { margin-top: 40px; color: var(--muted); font-size: 0.75rem; border-top: 
 .modal-box input { width: 100%; margin-bottom: 14px; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
 .modal-actions .danger { background: var(--red); color: var(--danger-contrast); }
+
+/* Day 26 ("Sparklines"). */
+.sparkline-cell { min-width: 70px; }
+.sparkline-placeholder, .sparkline-empty { color: var(--muted); font-size: 0.8rem; }
+.sparkline { display: block; }
+
+/* Day 26 ("Position notes"). */
+.notes-badge { margin-left: 6px; cursor: help; font-size: 0.85rem; }
+
+/* Day 26 ("Watchlist" / "Price alerts" / "Dividend log" / "Target
+   allocation" / "Sharing") — these all reuse the existing form/table look
+   (see the base `form`/`table` rules above), just a couple of layout tweaks
+   shared across all of them. */
+.watchlist form, .price-alerts form, .dividend-log form, .target-allocation form, .sharing-section form {
+  flex-wrap: wrap;
+}
+.section-hint { color: var(--muted); font-size: 0.82rem; margin: -4px 0 12px; }
+
+/* Day 26 ("view-only sharing"). */
+.shared-view-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: var(--accent);
+  color: var(--accent-contrast);
+  padding: 10px 16px;
+  border-radius: var(--radius-sm);
+  margin-top: 12px;
+  font-weight: 600;
+  font-size: 0.85rem;
+}
+.shared-view-banner button { background: var(--accent-contrast); color: var(--accent); flex-shrink: 0; }
+/* Read-only mode: hide every mutating control while viewing someone else's
+   shared portfolio, rather than letting them sit there disabled-looking.
+   Deliberately targets specific controls/sections rather than everything
+   inside #appContent, so the holdings table itself (the actual point of
+   sharing) stays fully visible. */
+body.shared-view-active .add-holding,
+body.shared-view-active .sell-holding,
+body.shared-view-active .quick-actions,
+body.shared-view-active #portfolioBar,
+body.shared-view-active .portfolio-bar-note,
+body.shared-view-active .watchlist,
+body.shared-view-active .price-alerts,
+body.shared-view-active .dividend-log,
+body.shared-view-active .target-allocation,
+body.shared-view-active .transaction-history,
+body.shared-view-active .realized-gains,
+body.shared-view-active .account-section,
+body.shared-view-active .sharing-section form,
+body.shared-view-active .sharing-section h3,
+body.shared-view-active .sharing-section table,
+body.shared-view-active .holdings .del-btn,
+body.shared-view-active .holdings .edit-btn,
+body.shared-view-active .holdings .sell-btn,
+body.shared-view-active .holdings .export-btn,
+body.shared-view-active #importHoldingsBtn,
+body.shared-view-active .import-status,
+body.shared-view-active .holdings-search {
+  display: none !important;
+}

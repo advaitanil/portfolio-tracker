@@ -10,7 +10,7 @@ export function buildSubject(metrics) {
   return `Portfolio ${value} ${arrow} ${changePct} — ${date}`;
 }
 
-export function renderEmail(metrics, news, commentary) {
+export function renderEmail(metrics, news, commentary, triggeredAlerts = []) {
   const arrow = (metrics.dayChangePct ?? 0) >= 0 ? "▲" : "▼";
   const headlineColor = (metrics.dayChangePct ?? 0) >= 0 ? "#1a9c6b" : "#c0392b";
   const ccy = metrics.baseCurrency;
@@ -41,6 +41,23 @@ export function renderEmail(metrics, news, commentary) {
     ? `<p style="line-height:1.6;color:#222">${commentary}</p>`
     : `<p style="color:#999">Commentary unavailable today (AI call failed or was skipped) — the figures above are unaffected.</p>`;
 
+  // Day 26 ("Price alerts") — only rendered at all when something actually
+  // fired this run; an empty/no-op section every single day would just be
+  // noise in an email that's already sent once a day regardless. Prices here
+  // are shown as plain numbers, NOT run through money(ccy) — target_price is
+  // set against whatever currency the ticker actually trades in (which can
+  // differ from the account's base currency), and this function has no
+  // reliable way to know that currency for an arbitrary alert row.
+  const alertsHtml = triggeredAlerts.length
+    ? `<h3 style="font-size:14px;color:#333;margin:20px 0 8px">🔔 Price alerts triggered</h3>
+       <ul style="font-size:13px;padding-left:18px;margin:0 0 20px">${triggeredAlerts
+         .map(
+           (a) =>
+             `<li style="margin-bottom:4px"><strong>${a.ticker}</strong> ${a.condition === "above" ? "rose above" : "fell below"} ${a.target_price} — now ${a.triggered_price}</li>`
+         )
+         .join("")}</ul>`
+    : "";
+
   return `<!doctype html>
 <html>
 <head>
@@ -67,6 +84,7 @@ export function renderEmail(metrics, news, commentary) {
       <div style="font-size:15px;color:${headlineColor}">${arrow} ${pct(metrics.dayChangePct)} today · Gain/loss ${money(metrics.totalGainAbs, ccy)} (${pct(metrics.totalGainPct)})</div>
     </div>
     <div style="padding:20px 24px">
+      ${alertsHtml}
       <table style="width:100%;font-size:13px;border-collapse:collapse;margin-bottom:8px">
         <tr><td style="color:#666;padding:4px 0">Best performer</td><td style="text-align:right">${metrics.best ? `${metrics.best.ticker} ${pct(metrics.best.dayChangePct)}` : "—"}</td></tr>
         <tr><td style="color:#666;padding:4px 0">Worst performer</td><td style="text-align:right">${metrics.worst ? `${metrics.worst.ticker} ${pct(metrics.worst.dayChangePct)}` : "—"}</td></tr>

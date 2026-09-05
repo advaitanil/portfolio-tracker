@@ -50,6 +50,21 @@ export function makeSupabase(env) {
       return res.json();
     },
 
+    // Day 26 ("view-only sharing"): resolves an invite email to a Supabase
+    // Auth user id. GoTrue's admin listUsers endpoint doesn't reliably
+    // support server-side filter-by-email across versions, so this scans one
+    // page of up to 1000 users and matches client-side — fine at this app's
+    // scale, and only ever called from the authed /find-user-by-email route
+    // (never exposed to arbitrary lookups beyond "does this email have an
+    // account, and what's its id").
+    getUserByEmail: async (email) => {
+      const res = await fetch(`${env.SUPABASE_URL}/auth/v1/admin/users?page=1&per_page=1000`, { headers: authHeaders });
+      if (!res.ok) throw new Error(`Supabase admin getUserByEmail failed: ${res.status} ${await res.text().catch(() => "")}`);
+      const json = await res.json();
+      const needle = email.trim().toLowerCase();
+      return (json.users || []).find((u) => u.email?.toLowerCase() === needle) || null;
+    },
+
     insertRows: (table, rows) =>
       req(`/${table}`, { method: "POST", headers: { Prefer: "return=minimal" }, body: JSON.stringify(rows) }),
 
@@ -92,5 +107,17 @@ export function makeSupabase(env) {
         headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
         body: JSON.stringify(rows),
       }),
+
+    // Day 26 ("Price alerts"): every currently-active alert, across every
+    // user — same "fetch the shared/whole set once, filter per user in JS"
+    // pattern as getHoldings, so checking alerts costs one extra query per
+    // scheduled run, not one per user.
+    getActivePriceAlerts: () => req(`/price_alerts?select=*&active=eq.true`),
+
+    // Generic single-row patch by id, used to flip a fired alert's `active`
+    // to false and stamp triggered_at/triggered_price. service_role bypasses
+    // RLS, same as every other write in this file.
+    updateRow: (table, id, patch) =>
+      req(`/${table}?id=eq.${id}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify(patch) }),
   };
 }

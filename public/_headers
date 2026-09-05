@@ -20,8 +20,12 @@
 #   - connect-src is scoped to exactly the two origins the app ever calls:
 #     Supabase (DB/auth) and the Cloudflare Worker (price refresh/run-now/
 #     ticker search). Nothing else should ever be reachable from page JS.
+#   - manifest-src/worker-src (Day 26, PWA support) are both explicit 'self'
+#     rather than left to fall back to default-src — same value either way
+#     here, but explicit avoids relying on fallback behavior that varies
+#     slightly across older browser versions.
 /*
-  Content-Security-Policy: default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self' https://awnlpgsbgswhohttniso.supabase.co https://portfolio-tracker-worker.rexorot64.workers.dev; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'; upgrade-insecure-requests
+  Content-Security-Policy: default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self' https://awnlpgsbgswhohttniso.supabase.co https://portfolio-tracker-worker.rexorot64.workers.dev; manifest-src 'self'; worker-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'; upgrade-insecure-requests
   Strict-Transport-Security: max-age=15552000; includeSubDomains; preload
   X-Frame-Options: DENY
   X-Content-Type-Options: nosniff

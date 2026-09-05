@@ -354,6 +354,113 @@ unlike Day 23, which was front-end only. See "Deploying this round" below.
    redeploys automatically. Covers everything else (app.js/index.html/
    style.css changes).
 
+### 3e. UI friendliness fixes (Day 25)
+
+Ten smaller UX polish items, done together since none needed a schema/Worker
+change: auto-clearing status messages, loading skeletons instead of "Loading…"
+text, inline quantity/price editing in the holdings table, a mobile card
+layout for the holdings table below 640px, autofocus on the first field in
+every form/modal, sort persistence across reloads (localStorage), a pinned
+"last synced" freshness indicator, search across portfolio name too (not just
+ticker), an unsaved-changes guard on the Add/Edit Holding form, and
+consistent disabled+loading-text states on every submit button. Front-end
+only — `git push` is the whole deploy for this round.
+
+### 3f. P2 feature batch: alerts, watchlist, dividends, benchmarks,
+    rebalancing, sharing, PWA (Day 26)
+
+The P2 items explicitly deferred back in Day 24 (3d above), now built out,
+plus a few extras (sparklines, position notes, PWA support) that came up in
+the same planning pass. Three items originally on this list were **skipped
+on purpose** — see "Known limitations" for why: tax-lot method for sells (FIFO/
+LIFO/specific-lot), AI-driven per-holding insights, and brokerage sync (Plaid).
+"Full alerts/goals/rebalancing/watchlist suite" was dropped as a checklist
+item since price alerts, watchlist, and target allocation below already cover
+it individually.
+
+This round touches all three layers again (schema, Worker, front end):
+
+- **Price alerts.** Set a "ticker rises above / falls below $X" threshold; a
+  new `price_alerts` table + a check inside the Worker's daily job
+  (`processUserDailyJob` in `index.js`) compares each active alert against
+  that run's freshly-fetched price. One-shot (flips to inactive the moment it
+  fires, doesn't re-fire every day the price stays past it) and checked once
+  per scheduled/manual run, **not continuously** — the soonest an alert can
+  fire is your next daily email or "Run now" click. A fired alert also gets
+  its own line in that day's email.
+- **Sparklines.** A small inline 30-day trend line per holding in the
+  holdings table, drawn from the existing `prices` cache's history (no new
+  table, no new API calls) — pure client-side rendering.
+- **Watchlist.** Track a ticker's price without owning it (new `watchlist`
+  table) — deliberately separate from `holdings` so it never touches
+  quantity/cost-basis math.
+- **Position notes.** A freeform notes field on each holding (new `notes`
+  column on `holdings`), shown as a small 📝 icon (hover for the text) next
+  to the ticker.
+- **Dividend log.** Manual entry (new `dividends` table) — neither this
+  project's market-data provider's free tier nor any other source here
+  includes dividend history, so you type in what you actually received.
+  Purely informational: doesn't feed into any gain/loss math elsewhere.
+- **Time-weighted return.** A new stat next to Realized Gain/Loss. This is an
+  **approximation**, not a textbook TWR — it treats each day's change in cost
+  basis (buys/sells) as that day's external cash flow and geometrically links
+  the resulting daily returns, which needs the exact intra-day TIMING of each
+  cash flow to be fully accurate and this app only has one cost-basis
+  snapshot per day. Close enough to be useful, not precise enough to reconcile
+  against a brokerage statement.
+- **Benchmark overlay.** Pick S&P 500/Nasdaq 100/Total US Market/a custom
+  ticker in the chart section; a new Worker route, `GET /benchmark-history`,
+  proxies Twelve Data's historical prices for it. The overlay line is
+  INDEXED to your portfolio's own starting value on the chart's first
+  plotted date (not the benchmark's real dollar price) — the two lines share
+  one y-axis so "which grew faster" is readable at a glance, at the cost of
+  the benchmark line no longer meaning literal dollars invested in it. A
+  display preference, stored in `localStorage`, not synced across devices.
+- **Target allocation + rebalancing hints.** Set a target % per asset type or
+  specific ticker (new `target_allocations` table); a new table under
+  Allocation shows target vs. current vs. gap. Current % is read from
+  whichever portfolio filter is currently selected, same as the Allocation
+  section above it. Targets don't have to sum to 100% — a partial set (e.g.
+  just "stocks: 60%") still gives a useful hint on that one line.
+- **Multi-account/household view — view-only sharing.** Invite another
+  signed-up user (by email) to see your holdings/portfolios/value history,
+  read-only, never able to edit/sell/delete anything and never seeing your
+  notes/dividends/transactions/watchlist/alerts (new `portfolio_shares`
+  table + additive SELECT-only RLS policies on `holdings`/`portfolios`/
+  `portfolio_value_history`/`portfolio_history` — see schema.sql's comments
+  for exactly what's shared and what isn't). Resolving an invite email to a
+  Supabase Auth user id needs the service_role key, so there's a new Worker
+  route for it: `GET /find-user-by-email`. **Important column-level caveat:**
+  RLS is row-level, not column-level — a shared "holdings" row is granted in
+  full, `notes` included; the app's own shared-view query deliberately
+  requests a column list that excludes `notes`, but that's an app-layer
+  convention, not a database guarantee. Don't share a portfolio with anyone
+  you wouldn't want to see your notes if they used their own Supabase client
+  directly against this table.
+- **PWA / add-to-homescreen.** `manifest.json` + a minimal `sw.js` (only ever
+  caches the static app shell — index.html/style.css/app.js/config.js/
+  theme-init.js/manifest.json — never Supabase/Worker responses, so it can't
+  serve stale prices or holdings) + two generated icons. "Add to Home
+  Screen"/"Install" now shows up in supporting browsers. This is still just a
+  bookmarked web page under the hood, not a native app — no push
+  notifications, no background sync, no offline data entry.
+
+**Deploying this round:**
+1. **Schema:** run the "Migration: Day 26 feature batch" block near the
+   bottom of `schema.sql` (creates `price_alerts`, `watchlist`, `dividends`,
+   `target_allocations`, `portfolio_shares`, and the `holdings.notes` column,
+   plus every RLS policy above) if your database predates this. **Read the
+   view-only-sharing RLS policies before running them** if you have any
+   privacy concerns about the column-level caveat noted above.
+2. **Worker:** from inside `worker/`, run `npm run deploy` (same as section 4
+   below) — ships the new `/find-user-by-email` and `/benchmark-history`
+   routes, the price-alert check inside the daily job, and the email
+   template's new "alerts triggered" section. No new secrets needed.
+3. **Front end:** `git add -A && git commit && git push` — covers
+   `app.js`/`index.html`/`style.css`, plus the three new static files
+   (`manifest.json`, `sw.js`, `icons/icon-192.png`, `icons/icon-512.png`) and
+   the updated `_headers` (adds `manifest-src`/`worker-src` to the CSP).
+
 ### 4. Worker
 
 ```
@@ -464,6 +571,10 @@ for more frequent news refreshes.
 - `fx_rates` is append-only with no unique constraint (by design — see schema.sql), so re-running `/backfill-history` re-appends the same historical rows each time rather than upserting. Harmless for correctness (lookups always take the closest match) but the table grows on every re-run.
 - CAPTCHA on sign-in/sign-up is NOT enabled (Day 24) — Supabase's own default rate limits (30 requests/5 min/IP) and this app's own client-side attempt throttle are the only abuse protection on the auth forms. Enabling Supabase's CAPTCHA toggle needs a matching hCaptcha/Turnstile widget added to the actual form plus a CSP exception, which wasn't done here to avoid shipping a server-side toggle with no working client half.
 - **Fixed (Day 20):** a total Twelve Data outage/rate-limit during a "Run now" or scheduled run used to write a null/stale row for every ticker into the append-only `prices` table, which — because readers always take the most recent row — permanently shadowed the last good cached price (symptom: every holding shows "stale" and total value drops to $0, even though nothing is actually wrong with the ticker data itself). `fetchPrices()` now distinguishes "the whole batch call failed" from "one ticker has no data," and `refreshSharedPriceFxCache`/`refreshPricesOnly` abort before writing anything — including today's `portfolio_value_history` point — when the whole batch fails. "Run now" and "Fetch prices" now surface a clear `Failed: ...` message instead of silently corrupting the cache. Note "Run now" still has no throttle (unlike `/refresh-prices`'s 2-minute one), so heavy manual testing can still burn through Twelve Data's daily credit limit — that part is unchanged, just no longer destructive when it happens.
+- **Skipped on purpose (Day 26):** tax-lot method for sells (FIFO/LIFO/specific-lot) — holdings currently auto-merge into one weighted-average row per ticker/portfolio/currency, so there's no separate-lots data model to pick a lot from at sell time; adding one would mean turning off auto-merge (or making it opt-in) and reworking the sell flow, a bigger change than this round's scope. AI-driven per-holding insights and brokerage sync (Plaid) were also skipped this round — the former needs an LLM API key wired up as a new Worker secret, the latter needs a Plaid developer account and its own OAuth-like Link flow/webhook handling — both are real projects on their own, not small additions.
+- **View-only sharing (Day 26) is row-level, not column-level.** RLS grants a shared viewer the WHOLE `holdings` row when it matches, `notes` included — the app's own shared-view query asks for a column list that excludes `notes`, but that's convention, not a database-enforced guarantee. Someone using their own Supabase client (not this app's UI) against a portfolio shared with them could still read `notes` on a shared holding. Don't share with anyone you wouldn't want to see that.
+- **Time-weighted return (Day 26)** is an approximation, not a textbook TWR — see the "P2 feature batch" section above for exactly what it does and why. Don't treat it as reconciliation-grade.
+- **Benchmark overlay (Day 26)** only covers whatever ticker Twelve Data's `time_series` endpoint recognizes (same coverage as the ticker search elsewhere in this app) and is indexed/rebased, not a literal dollar-for-dollar "what if you'd bought this instead" simulation (no dividend reinvestment, no matching your actual buy/sell timing).
 
 ## Disclaimer (required, Section 10)
 
