@@ -28,7 +28,8 @@ import { fetchHistoricalPrices, fetchHistoricalFxRange, computeHistoryValues } f
 // ever sent, no matter what the Worker itself would have returned.
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, OPTIONS",
+  // Day 24: POST added for /delete-account — every other route is a GET.
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers": "Authorization, Content-Type",
 };
 
@@ -108,6 +109,26 @@ export default {
       const result = await backfillHistory(env);
       return Response.json(result, { headers: CORS_HEADERS });
     }
+    if (url.pathname === "/delete-account") {
+      // Day 24 (review P1: self-serve account deletion). POST-only (this is
+      // a destructive, irreversible action) and scoped strictly to the
+      // caller's own account — there's no admin_key path here at all, unlike
+      // /run or /backfill-history, because this should never be callable for
+      // anyone but the account owner themselves.
+      if (req.method !== "POST") {
+        return Response.json({ error: "use POST" }, { status: 405, headers: CORS_HEADERS });
+      }
+      const authedUser = await getAuthedUser(req, env);
+      if (!authedUser) return Response.json({ error: "unauthorized" }, { status: 401, headers: CORS_HEADERS });
+      try {
+        const sb = makeSupabase(env);
+        await sb.deleteUser(authedUser.id);
+        return Response.json({ status: "deleted" }, { headers: CORS_HEADERS });
+      } catch (err) {
+        console.error(`Account deletion failed for user ${authedUser.id}:`, err);
+        return Response.json({ error: err.message }, { status: 500, headers: CORS_HEADERS });
+      }
+    }
     if (url.pathname === "/search-symbols") {
       const authedUser = await getAuthedUser(req, env);
       if (!authedUser) return Response.json({ error: "unauthorized" }, { status: 401, headers: CORS_HEADERS });
@@ -116,7 +137,7 @@ export default {
       return Response.json(result, { headers: CORS_HEADERS });
     }
     return new Response(
-      "Portfolio Tracker Worker. Try /run, /run?user_id=..., /status?user_id=..., /refresh-prices, /backfill-history, or /search-symbols?q=...",
+      "Portfolio Tracker Worker. Try /run, /run?user_id=..., /status?user_id=..., /refresh-prices, /backfill-history, /search-symbols?q=..., or POST /delete-account",
       { status: 200 }
     );
   },

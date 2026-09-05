@@ -265,6 +265,95 @@ focus/motion/touch targets) are intentionally out of scope for this round —
 see the review doc's action-plan table for the full list and suggested
 owners/effort.
 
+### 3d. All 6 P1 items + remember me + show password (Day 24)
+
+All 6 **P1** items from the review are done (P2 — benchmarks/TWR/dividends/
+fees and alerts/goals/rebalancing/watchlists — was explicitly deferred as its
+own future project, per the review's own 1–3-week effort estimate for each).
+Two extra, non-review feature requests are bundled into this same round since
+they touch the same sign-in form: a "Remember me" toggle and a show/hide
+password control.
+
+**This round touches all three layers — schema, Worker, and front end —**
+unlike Day 23, which was front-end only. See "Deploying this round" below.
+
+- **Transaction ledger (`transactions` table, new).** Every add/edit/merge/
+  sell/delete/import now writes an immutable audit-trail row (`logTransaction()`
+  in `app.js`) — RLS on this table only grants `select`/`insert`, no
+  `update`/`delete` policy at all, so even a compromised client can't rewrite
+  history. Surfaced as a new "Transaction History" section on the dashboard,
+  with its own CSV export. Needs the schema migration (see below) — nothing
+  before that migration runs gets a retroactive entry.
+- **Price return vs. FX return, shown (not just computed).** The Worker's
+  `metrics.js` already computed this split for the (never-rendered) email
+  math; this mirrors it client-side and puts it in a hover title on the
+  "Day Δ" column, e.g. "Price: +1.2% · FX: −0.4%". The blended Day Δ % itself
+  also got more correct in the process — it used to be price-only even for
+  foreign-currency holdings (silently ignoring FX's contribution to the
+  day's move), now it's the true base-currency blended return.
+- **Duplicate/lot detection.** Adding/editing already auto-merged an exact
+  ticker+portfolio+currency match (Day 16) — what was missing was any
+  visibility when it DIDN'T merge. Now: a "×N lots" badge next to a ticker
+  that's split across portfolios/currencies (hover for the breakdown), and a
+  heads-up on the Add Holding form's ticker field (on blur) before you even
+  submit.
+- **Self-serve account deletion + data export.** A new "Account" section on
+  the dashboard: "Export all my data" bundles every table's rows for your
+  account into one JSON file (client-side, RLS already scopes every read);
+  "Delete my account" requires typing DELETE to confirm, then calls a new
+  Worker route, `POST /delete-account`, which uses the service_role key to
+  delete the `auth.users` row — every user-scoped table has
+  `on delete cascade` on `user_id`, so that one call removes everything.
+- **CSV import.** Symmetric with the existing Export CSV — same column
+  layout, so a file this app exported round-trips back in. Reuses the exact
+  same merge-or-insert logic as the Add Holding form (same weighted-average
+  merge on an exact ticker+portfolio+currency match), logs an `import`-type
+  transaction per row, and reports a summary (imported / merged / skipped)
+  plus the first row-level error, if any.
+- **Auth hardening.** Three parts: (1) `sanitizeAuthError()` masks the one
+  real enumeration vector in this project's config — email confirmation is
+  OFF, so sign-up on an already-registered email returns an explicit
+  "already registered" error, which is now replaced with generic copy that
+  doesn't confirm or deny an account exists (`forgotPasswordForm` was already
+  neutral from Day 23; this extends the same principle to the sign-up path).
+  Genuinely useful errors (weak password, malformed email, wrong password)
+  pass through unchanged. (2) A client-side attempt throttle on the sign-in
+  form (5 failures / 5 min → 60s cooldown) — real defense-in-depth against a
+  script hammering one browser tab, but explicitly NOT a substitute for
+  server-side limits. (3) Verified, not assumed: Supabase's own Auth rate
+  limits are already active by default for this project (30 sign-up/sign-in
+  requests per 5 min per IP, confirmed live in Auth > Rate Limits — nothing
+  to configure), and Auth > URL Configuration's redirect allow-list is
+  already scoped to exactly one domain (`https://portfolio.rexorot.com/**`,
+  no stray entries). **Left alone on purpose:** Auth > Attack Protection's
+  CAPTCHA toggle is currently off, and turning it on requires a matching
+  hCaptcha/Turnstile widget in the actual sign-in form (plus a CSP
+  `script-src` exception for whichever provider) — flipping the server-side
+  toggle alone would hard-break every sign-in/sign-up until that widget
+  exists, so this stays a documented gap rather than a half-shipped feature.
+  "Prevent use of leaked passwords" is also off and appears to be gated to a
+  paid Supabase plan (this project is on Free) — not something to toggle
+  from this dashboard either way.
+- **Remember me.** A checkbox on the sign-in form (defaults checked)
+  controlling whether the Supabase session persists across browser restarts
+  (`localStorage`) or only for the current tab/session (`sessionStorage`) —
+  see the `rememberMeStorage` custom storage adapter at the top of `app.js`.
+- **Show/hide password.** A small "Show"/"Hide" toggle button on every
+  password field (sign-in, set-new-password) — standard Constraint-API-free
+  `input.type` toggle, wired once at load.
+
+**Deploying this round:**
+1. **Schema:** run the "Migration: adding the transaction ledger" block near
+   the bottom of `schema.sql` (creates `transactions` + RLS policies) if your
+   database predates this.
+2. **Worker:** from inside the `worker/` directory, run `npm run deploy`
+   (same command as section 4 below) — ships the new `POST /delete-account`
+   route and `supabase.js`'s `deleteUser` helper. No new secrets needed
+   (reuses `SUPABASE_SERVICE_ROLE_KEY`, already set).
+3. **Front end:** `git add -A && git commit && git push` — Cloudflare Pages
+   redeploys automatically. Covers everything else (app.js/index.html/
+   style.css changes).
+
 ### 4. Worker
 
 ```
@@ -373,6 +462,7 @@ for more frequent news refreshes.
 - Metrics logic is duplicated between `public/app.js` (for the live dashboard) and `worker/src/lib/metrics.js` (for the email) rather than shared — acceptable for this scope, but a real product would extract one shared module.
 - No automated tests yet. Given the brief's emphasis on correctness, adding a small test file for `metrics.js` covering the hand-verified examples from Day 4 would be a good next step.
 - `fx_rates` is append-only with no unique constraint (by design — see schema.sql), so re-running `/backfill-history` re-appends the same historical rows each time rather than upserting. Harmless for correctness (lookups always take the closest match) but the table grows on every re-run.
+- CAPTCHA on sign-in/sign-up is NOT enabled (Day 24) — Supabase's own default rate limits (30 requests/5 min/IP) and this app's own client-side attempt throttle are the only abuse protection on the auth forms. Enabling Supabase's CAPTCHA toggle needs a matching hCaptcha/Turnstile widget added to the actual form plus a CSP exception, which wasn't done here to avoid shipping a server-side toggle with no working client half.
 - **Fixed (Day 20):** a total Twelve Data outage/rate-limit during a "Run now" or scheduled run used to write a null/stale row for every ticker into the append-only `prices` table, which — because readers always take the most recent row — permanently shadowed the last good cached price (symptom: every holding shows "stale" and total value drops to $0, even though nothing is actually wrong with the ticker data itself). `fetchPrices()` now distinguishes "the whole batch call failed" from "one ticker has no data," and `refreshSharedPriceFxCache`/`refreshPricesOnly` abort before writing anything — including today's `portfolio_value_history` point — when the whole batch fails. "Run now" and "Fetch prices" now surface a clear `Failed: ...` message instead of silently corrupting the cache. Note "Run now" still has no throttle (unlike `/refresh-prices`'s 2-minute one), so heavy manual testing can still burn through Twelve Data's daily credit limit — that part is unchanged, just no longer destructive when it happens.
 
 ## Disclaimer (required, Section 10)

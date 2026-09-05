@@ -61,7 +61,20 @@
          only one prominent, unambiguous action is on screen at a time. -->
     <form id="loginForm" novalidate>
       <input name="email" type="email" placeholder="Email" aria-label="Email" required autocomplete="username" />
-      <input name="password" type="password" placeholder="Password" aria-label="Password" required autocomplete="current-password" minlength="6" />
+      <div class="password-field">
+        <input name="password" type="password" placeholder="Password" aria-label="Password" required autocomplete="current-password" minlength="6" />
+        <button type="button" class="show-password-toggle" aria-label="Show password" aria-pressed="false">Show</button>
+      </div>
+      <!-- Day 24: controls whether the session survives closing the browser
+           (localStorage) or only lasts this tab/session (sessionStorage) —
+           see the rememberMeStorage adapter passed into createClient() at
+           the top of app.js. Defaults checked, matching most users'
+           expectation of staying signed in; unchecking is meant for a
+           shared/public computer. -->
+      <label class="remember-me-label">
+        <input type="checkbox" name="remember" id="rememberMeCheckbox" checked />
+        Remember me
+      </label>
       <input type="hidden" name="action" id="loginActionInput" value="signin" />
       <button type="submit" id="loginSubmitBtn">Sign in</button>
     </form>
@@ -100,8 +113,14 @@
   <section class="login-section" id="resetPasswordSection" style="display: none">
     <h1>Set a new password</h1>
     <form id="resetPasswordForm" novalidate>
-      <input name="password" type="password" placeholder="New password" aria-label="New password" required autocomplete="new-password" minlength="6" />
-      <input name="confirmPassword" type="password" placeholder="Confirm new password" aria-label="Confirm new password" required autocomplete="new-password" minlength="6" />
+      <div class="password-field">
+        <input name="password" type="password" placeholder="New password" aria-label="New password" required autocomplete="new-password" minlength="6" />
+        <button type="button" class="show-password-toggle" aria-label="Show password" aria-pressed="false">Show</button>
+      </div>
+      <div class="password-field">
+        <input name="confirmPassword" type="password" placeholder="Confirm new password" aria-label="Confirm new password" required autocomplete="new-password" minlength="6" />
+        <button type="button" class="show-password-toggle" aria-label="Show password" aria-pressed="false">Show</button>
+      </div>
       <button type="submit">Update password</button>
     </form>
     <button type="button" id="cancelResetBtn" class="link-btn">Back to sign in</button>
@@ -209,6 +228,11 @@
           <input name="ticker" id="tickerInput" placeholder="Ticker (e.g. AAPL)" aria-label="Ticker symbol" required maxlength="10" autocomplete="off" />
           <ul id="tickerSuggestions" class="ticker-suggestions" style="display: none"></ul>
         </div>
+        <!-- Day 24 (review P1: duplicate/un-aggregated holdings) — a heads-up
+             BEFORE submit if this ticker already exists elsewhere under a
+             different portfolio/currency (so it won't auto-merge), rather
+             than only explaining after the fact. -->
+        <p class="ticker-duplicate-hint" id="tickerDuplicateHint" aria-live="polite"></p>
         <select name="portfolio_id" id="portfolioFormSelect" aria-label="Portfolio"></select>
         <select name="asset_type" aria-label="Asset type" required>
           <option value="stock">Stock</option>
@@ -233,7 +257,19 @@
     </section>
 
     <section class="holdings">
-      <h2>Holdings <button type="button" id="exportHoldingsBtn" class="export-btn">Export CSV</button></h2>
+      <h2>
+        Holdings
+        <button type="button" id="exportHoldingsBtn" class="export-btn">Export CSV</button>
+        <!-- Day 24 (review P1: CSV/brokerage import). Symmetric with Export
+             CSV above — same column layout, so a file exported from here
+             round-trips back in. The actual <input type="file"> stays
+             visually hidden; this button just proxies a click to it (a
+             file input can't be restyled directly and still work
+             consistently across browsers). -->
+        <button type="button" id="importHoldingsBtn" class="export-btn">Import CSV</button>
+        <input type="file" id="importHoldingsFile" accept=".csv,text/csv" style="display: none" aria-hidden="true" tabindex="-1" />
+      </h2>
+      <p class="import-status" id="importStatus" aria-live="polite"></p>
       <input type="text" id="holdingsSearch" class="holdings-search" placeholder="Search by ticker…" aria-label="Search holdings by ticker" autocomplete="off" />
       <table id="holdingsTable">
         <thead>
@@ -279,6 +315,53 @@
           <tr><td colspan="6">Loading…</td></tr>
         </tbody>
       </table>
+    </section>
+
+    <!-- Day 24 (review P1: "no transaction ledger / audit history"). A
+         read-only, append-only log of every holdings-affecting event — see
+         logTransaction() in app.js, called from the add/edit/sell/delete
+         handlers and CSV import. Distinct from Realized Gains above (closed
+         positions only) and from the raw holdings table (current state
+         only): this is the one place a position stays traceable back to the
+         actual events that produced it. -->
+    <section class="transaction-history">
+      <h2>Transaction History <button type="button" id="exportTransactionsBtn" class="export-btn">Export CSV</button></h2>
+      <table>
+        <thead>
+          <tr><th scope="col">Date</th><th scope="col">Event</th><th scope="col">Ticker</th><th scope="col">Qty</th><th scope="col">Price</th><th scope="col">Notes</th></tr>
+        </thead>
+        <tbody id="transactionsBody">
+          <tr><td colspan="6">Loading…</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- Day 24 (review P1: "no account/data deletion or privacy policy" —
+         the privacy policy itself shipped Day 23; this is the self-serve
+         delete/export half of that finding). Export reads straight from
+         Supabase (RLS already scopes every query to this account, same as
+         everywhere else in the app); delete calls the Worker's
+         /delete-account (see worker/src/index.js), the one action that
+         genuinely needs the service_role key, since removing the actual
+         auth.users row isn't something the anon-key client can do itself. -->
+    <section class="account-section" id="accountSection">
+      <h2>Account</h2>
+      <div class="account-action-row">
+        <div>
+          <strong>Export all your data</strong>
+          <p class="account-action-desc">Every holding, portfolio, realized gain, transaction, and value-history point tied to your account, as one JSON file.</p>
+        </div>
+        <button type="button" id="exportAllDataBtn">Export all my data</button>
+      </div>
+      <div class="account-action-row account-danger-zone">
+        <div>
+          <strong>Delete your account</strong>
+          <p class="account-action-desc">Permanently deletes your account and everything tied to it — holdings, portfolios, realized gains, transaction history, value history. This cannot be undone.</p>
+        </div>
+        <button type="button" id="deleteAccountBtn" class="del-btn">Delete my account</button>
+      </div>
+      <p class="form-error" id="accountError" aria-live="polite"></p>
+      <p class="login-hint" id="accountHint" aria-live="polite"></p>
     </section>
 
     <footer>

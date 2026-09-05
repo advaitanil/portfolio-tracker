@@ -169,6 +169,38 @@ th[data-sort] .sort-arrow { margin-left: 3px; font-size: 0.7rem; }
 }
 .stale { color: var(--red); font-size: 0.75rem; margin-left: 6px; }
 .nav-tag { color: var(--muted); font-size: 0.7rem; margin-left: 6px; border: 1px solid var(--border); border-radius: 4px; padding: 1px 4px; }
+/* Day 24 (review P1: duplicate/un-aggregated holdings) — flags a ticker
+   split across multiple lots (different portfolios/currencies, so not
+   auto-merged) right where you'd see it, with the breakdown in the title. */
+.lot-badge { color: var(--accent); font-size: 0.7rem; margin-left: 6px; border: 1px solid var(--accent); border-radius: 4px; padding: 1px 4px; cursor: help; }
+.ticker-duplicate-hint { color: var(--muted); font-size: 0.78rem; margin: -6px 0 4px; min-height: 0; }
+.ticker-duplicate-hint:not(:empty) { color: var(--accent); }
+
+/* Day 24: transaction ledger event-type tags. */
+.event-tag { font-size: 0.72rem; font-weight: 600; padding: 2px 7px; border-radius: 4px; border: 1px solid var(--border); color: var(--muted); }
+.event-tag-buy { color: var(--green); border-color: var(--green); }
+.event-tag-sell { color: var(--accent); border-color: var(--accent); }
+.event-tag-delete { color: var(--red); border-color: var(--red); }
+.event-tag-edit, .event-tag-merge { color: var(--muted); }
+.event-tag-import { color: var(--accent); border-color: var(--accent); }
+
+/* Day 24: Account section (export/delete). */
+.account-action-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--border);
+}
+.account-action-row:last-of-type { border-bottom: none; }
+.account-action-desc { color: var(--muted); font-size: 0.82rem; margin: 4px 0 0; max-width: 480px; }
+.account-danger-zone strong { color: var(--red); }
+.account-action-row button { flex-shrink: 0; }
+
+.import-status { color: var(--muted); font-size: 0.82rem; margin: -6px 0 10px; }
+.import-status.negative { color: var(--red); }
+.import-status.positive { color: var(--green); }
 .del-btn, .edit-btn, .sell-btn, #cancelEditBtn, #cancelSellBtn { background: transparent; border: 1px solid var(--border); color: var(--muted); cursor: pointer; font-weight: 500; }
 .del-btn:hover { color: var(--red); border-color: var(--red); }
 .edit-btn:hover { color: var(--accent); border-color: var(--accent); }
@@ -194,6 +226,37 @@ footer { margin-top: 40px; color: var(--muted); font-size: 0.75rem; border-top: 
 .login-legal { color: var(--muted); font-size: 0.75rem; margin-top: 24px; line-height: 1.4; }
 .login-legal a { color: var(--muted); text-decoration: underline; }
 .login-legal a:hover { color: var(--accent); }
+
+/* Day 24: show/hide password toggle button, overlaid on the right edge of
+   the password input rather than a separate control, matching the common
+   pattern users already expect. */
+.password-field { position: relative; }
+.password-field input { width: 100%; padding-right: 54px; }
+.show-password-toggle {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+.show-password-toggle:hover { color: var(--accent); opacity: 1; }
+
+.remember-me-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.82rem;
+  color: var(--muted);
+  cursor: pointer;
+  margin-top: 2px;
+}
+.remember-me-label input[type="checkbox"] { width: auto; padding: 0; cursor: pointer; }
 
 .legal-page { max-width: 640px; margin: 0 auto; line-height: 1.6; }
 .legal-page h1 { margin-bottom: 4px; }

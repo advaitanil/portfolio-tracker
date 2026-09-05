@@ -177,6 +177,35 @@ create table if not exists realized_gains (
 );
 create index if not exists idx_realized_gains_user_date on realized_gains (user_id, sell_date desc);
 
+-- ── transactions ────────────────────────────────────────────────────────────
+-- Day 24 (review P1: "no transaction ledger / audit history"). Append-only
+-- log of every holdings-affecting event — buy, sell, edit, merge, delete,
+-- import — kept separate from `holdings` (current state) and `realized_gains`
+-- (closed-position summaries) so positions stay traceable back to the actual
+-- events that produced them, even after a holding itself is edited/deleted.
+-- Nothing ever updates or deletes a row here; it's the audit trail.
+create table if not exists transactions (
+  id            uuid primary key default gen_random_uuid(),
+  user_id       uuid not null references auth.users (id) on delete cascade,
+  -- Nullable: the holding this referred to may since have been merged/deleted
+  -- — the row itself still stands as a record of what happened.
+  holding_id    uuid,
+  portfolio_id  uuid,
+  ticker        text not null,
+  event_type    text not null check (event_type in ('buy', 'sell', 'edit', 'merge', 'delete', 'import')),
+  quantity      numeric,
+  price         numeric,
+  currency      text,
+  event_date    date not null,
+  -- Freeform context per event type — e.g. an edit's before/after values, or
+  -- which row a merge combined into. Keeps this one table generic instead of
+  -- needing a different shape per event_type.
+  notes         text,
+  created_at    timestamptz not null default now()
+);
+create index if not exists idx_transactions_user_date on transactions (user_id, event_date desc);
+create index if not exists idx_transactions_user_ticker on transactions (user_id, ticker);
+
 -- ── Row Level Security ──────────────────────────────────────────────────────
 -- NOTE: this project deviates here from the brief's agreed scope (Section 2:
 -- "single portfolio, no login, keep it simple") — it's a full multi-user app
@@ -197,6 +226,7 @@ alter table daily_reports enable row level security;
 alter table portfolio_value_history enable row level security;
 alter table portfolio_history enable row level security;
 alter table realized_gains enable row level security;
+alter table transactions enable row level security;
 
 create policy "users manage own portfolios" on portfolios for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
 create policy "users manage own holdings" on holdings for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
@@ -206,6 +236,12 @@ create policy "users manage own daily_reports" on daily_reports for all using (a
 create policy "users manage own portfolio_value_history" on portfolio_value_history for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
 create policy "users manage own portfolio_history" on portfolio_history for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
 create policy "users manage own realized_gains" on realized_gains for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+-- Deliberately only select + insert (no update/delete policy at all) — an
+-- audit trail that the app itself could edit or erase wouldn't be much of
+-- one. RLS denies anything with no matching policy, so this is enforced at
+-- the database level, not just by app.js never calling update/delete on it.
+create policy "users read own transactions" on transactions for select using (auth.uid() = user_id);
+create policy "users insert own transactions" on transactions for insert with check (auth.uid() = user_id);
 
 -- No seed data here on purpose: holdings now require a real user_id, and
 -- there's no user until someone signs up through the app. Sign up, then add
@@ -273,3 +309,31 @@ create policy "users manage own realized_gains" on realized_gains for all using 
 -- historical cost-basis values using each holding's actual buy-date FX
 -- rate — until then the buy-in line only starts from "today" (live updates)
 -- going forward.
+
+-- ── Migration: adding the transaction ledger (Day 24) ──────────────────────
+-- Run this once if your database predates the `transactions` table above:
+--
+--   create table if not exists transactions (
+--     id            uuid primary key default gen_random_uuid(),
+--     user_id       uuid not null references auth.users (id) on delete cascade,
+--     holding_id    uuid,
+--     portfolio_id  uuid,
+--     ticker        text not null,
+--     event_type    text not null check (event_type in ('buy', 'sell', 'edit', 'merge', 'delete', 'import')),
+--     quantity      numeric,
+--     price         numeric,
+--     currency      text,
+--     event_date    date not null,
+--     notes         text,
+--     created_at    timestamptz not null default now()
+--   );
+--   create index if not exists idx_transactions_user_date on transactions (user_id, event_date desc);
+--   create index if not exists idx_transactions_user_ticker on transactions (user_id, ticker);
+--   alter table transactions enable row level security;
+--   create policy "users read own transactions" on transactions for select using (auth.uid() = user_id);
+--   create policy "users insert own transactions" on transactions for insert with check (auth.uid() = user_id);
+--
+-- Nothing before this migration ran gets a retroactive transaction row — the
+-- ledger only starts recording events from whenever this table exists.
+-- Existing holdings/realized_gains history stays exactly as accurate as it
+-- already was; this doesn't rewrite anything.

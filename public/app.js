@@ -4,7 +4,37 @@
 // prices in the database" is the single most important design decision here).
 // The Cloudflare Worker is what refreshes those caches on a schedule.
 
-const sb = window.supabase.createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY);
+// Day 24: "Remember me" toggle on the sign-in form. Supabase's client
+// persists the session via whatever storage object it's given — by default
+// always localStorage, which survives closing the browser entirely. This
+// custom storage adapter reads a small (non-sensitive) boolean preference —
+// "sb-remember-me" — to decide, PER CALL, whether the actual session token
+// goes into localStorage (survives browser restart) or sessionStorage
+// (cleared when the tab/browser closes). The preference itself always lives
+// in localStorage (it's just a flag, not a credential) so it's still known
+// the next time the adapter runs, before any session exists yet.
+const REMEMBER_ME_KEY = "sb-remember-me";
+const rememberMeStorage = {
+  getItem: (key) => {
+    const remember = localStorage.getItem(REMEMBER_ME_KEY) !== "false"; // default true — see login form checkbox default
+    return (remember ? localStorage : sessionStorage).getItem(key);
+  },
+  setItem: (key, value) => {
+    const remember = localStorage.getItem(REMEMBER_ME_KEY) !== "false";
+    (remember ? localStorage : sessionStorage).setItem(key, value);
+    // Clear the other store too, so a stale/duplicate token can't linger
+    // there from a previous sign-in under the opposite setting.
+    (remember ? sessionStorage : localStorage).removeItem(key);
+  },
+  removeItem: (key) => {
+    localStorage.removeItem(key);
+    sessionStorage.removeItem(key);
+  },
+};
+
+const sb = window.supabase.createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY, {
+  auth: { storage: rememberMeStorage, persistSession: true, autoRefreshToken: true },
+});
 const BASE_CURRENCY = window.BASE_CURRENCY || "USD";
 
 // Light/dark theme toggle (Day 18). The actual theme is applied by a tiny
@@ -23,6 +53,23 @@ document.getElementById("themeToggleBtn").addEventListener("click", () => {
     localStorage.setItem("theme", "light");
   }
 });
+
+// Day 24: show/hide password toggle — every `.password-field` wrapper in the
+// static HTML (sign-in, reset-password) has one input + one
+// `.show-password-toggle` button as siblings. Wired once at load since none
+// of these are dynamically rendered later.
+document.querySelectorAll(".show-password-toggle").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    const input = btn.previousElementSibling;
+    if (!input) return;
+    const showing = input.type === "text";
+    input.type = showing ? "password" : "text";
+    btn.textContent = showing ? "Show" : "Hide";
+    btn.setAttribute("aria-pressed", String(!showing));
+    btn.setAttribute("aria-label", showing ? "Show password" : "Hide password");
+  });
+});
+
 const STALE_AFTER_MS = 1000 * 60 * 60 * 24; // stocks/ETFs trade intraday — flag stale after 24h
 // Day 12: funds priced once/day (NAV) shouldn't be flagged stale on the same
 // clock as an intraday stock quote. A NAV struck yesterday afternoon is still
@@ -148,6 +195,30 @@ async function authedFetch(url, opts = {}) {
   return fetch(url, { ...opts, headers });
 }
 
+// Day 24 (review P1: "no transaction ledger / audit history"). Best-effort,
+// fire-and-forget: a failure here should never block the actual holdings
+// mutation it's recording (the ledger is a nice-to-have audit trail, not a
+// source of truth — `holdings`/`realized_gains` still are), so this never
+// throws, only warns to the console. holdingId/portfolioId are passed
+// through as plain values (not looked up again) since the caller always
+// already has them at the point it's mutating a holding.
+async function logTransaction({ holdingId = null, portfolioId = null, ticker, eventType, quantity = null, price = null, currency = null, eventDate, notes = null }) {
+  if (!currentUserId) return;
+  const { error } = await sb.from("transactions").insert({
+    user_id: currentUserId,
+    holding_id: holdingId,
+    portfolio_id: portfolioId,
+    ticker,
+    event_type: eventType,
+    quantity,
+    price,
+    currency,
+    event_date: eventDate,
+    notes,
+  });
+  if (error) console.warn("Could not log transaction (continuing anyway):", error.message);
+}
+
 async function fetchLatestPrices(tickers) {
   if (tickers.length === 0) return {};
   const { data, error } = await sb
@@ -175,6 +246,37 @@ async function fetchLatestFx(currencies) {
   for (const row of data) {
     // fx_rates stores BASE->quote; we need quote->BASE, so invert.
     if (!(row.quote in rates)) rates[row.quote] = 1 / row.rate;
+  }
+  return rates;
+}
+
+// Day 24: the FX snapshot immediately BEFORE the latest one per currency —
+// fx_rates is append-only (one new row per Worker refresh), so the second
+// most recent row is the closest available proxy for "yesterday's rate",
+// same simplification the Worker's own getFxRateBefore() makes server-side.
+// Used only to split price return from FX return for display — never for
+// any actual money math (cost basis / current value keep using "today's"
+// single latest rate from fetchLatestFx, unchanged).
+async function fetchPreviousFx(currencies) {
+  const needed = currencies.filter((c) => c !== BASE_CURRENCY);
+  const rates = {};
+  if (needed.length === 0) return rates;
+  const { data, error } = await sb
+    .from("fx_rates")
+    .select("quote, rate, as_of")
+    .eq("base", BASE_CURRENCY)
+    .in("quote", needed)
+    .order("as_of", { ascending: false });
+  if (error || !data) return rates;
+  const latestAsOfByQuote = {};
+  for (const row of data) {
+    if (!(row.quote in latestAsOfByQuote)) {
+      latestAsOfByQuote[row.quote] = row.as_of; // first row per currency = "today"
+      continue;
+    }
+    if (!(row.quote in rates) && row.as_of !== latestAsOfByQuote[row.quote]) {
+      rates[row.quote] = 1 / row.rate; // first DIFFERENT snapshot = "yesterday"
+    }
   }
   return rates;
 }
@@ -217,7 +319,15 @@ async function fetchHistoricalFxForDates(pairs) {
   return result;
 }
 
-function computeRow(holding, priceRow, fxRates, buyFxOverride) {
+// Day 24 (review P1: "gain/loss blends price & FX return"). Worker-side
+// metrics.js already computed this split for the (unused-in-the-UI) email
+// math — this mirrors that same logic client-side for the dashboard, which
+// has always had its own separate implementation (see README "Known
+// limitations" on the metrics duplication). fxRatesYesterday, when available,
+// is the previous cached FX snapshot per currency (see fetchPreviousFx) —
+// without it, this falls back to the old price-only day change exactly like
+// before this feature existed.
+function computeRow(holding, priceRow, fxRates, buyFxOverride, fxRatesYesterday) {
   const fx = fxRates[priceRow?.currency] ?? null;
   const priceInBase = priceRow && fx ? priceRow.price * fx : null;
   // buyFxOverride, when present, is the ACTUAL rate on this holding's
@@ -230,8 +340,36 @@ function computeRow(holding, priceRow, fxRates, buyFxOverride) {
   const gainPct = gainAbs != null && costBasis ? (gainAbs / costBasis) * 100 : null;
 
   let dayChangePct = null;
+  let priceReturnPct = null;
+  let fxReturnPct = null;
+  const priceCcy = priceRow?.currency;
   if (priceRow?.previous_close) {
-    dayChangePct = ((priceRow.price - priceRow.previous_close) / priceRow.previous_close) * 100;
+    // Price return: the instrument's own move, in its own currency — never
+    // affected by FX at all.
+    priceReturnPct = ((priceRow.price - priceRow.previous_close) / priceRow.previous_close) * 100;
+
+    if (!priceCcy || priceCcy === BASE_CURRENCY) {
+      dayChangePct = priceReturnPct;
+      fxReturnPct = 0;
+    } else {
+      const fxYesterday = fxRatesYesterday?.[priceCcy];
+      const fxToday = fxRates[priceCcy];
+      if (fxYesterday && fxToday && priceInBase != null) {
+        const prevCloseInBaseYesterday = priceRow.previous_close * fxYesterday;
+        // True blended return, computed directly from base-currency values —
+        // NOT priceReturnPct + fxReturnPct, which would only approximate it
+        // (the two compound rather than add for anything but tiny moves).
+        dayChangePct = ((priceInBase - prevCloseInBaseYesterday) / prevCloseInBaseYesterday) * 100;
+        // How much the holding's currency itself moved against the base
+        // currency, isolated from the instrument's own price move.
+        fxReturnPct = ((fxToday - fxYesterday) / fxYesterday) * 100;
+      } else {
+        // No FX history cached yet for this currency — same graceful
+        // degrade as before this feature existed: show price-only change
+        // rather than block on missing data.
+        dayChangePct = priceReturnPct;
+      }
+    }
   }
 
   const isFund = holding.asset_type === "fund";
@@ -241,7 +379,7 @@ function computeRow(holding, priceRow, fxRates, buyFxOverride) {
     priceRow.is_stale ||
     Date.now() - new Date(priceRow.as_of).getTime() > staleThreshold;
 
-  return { currentValue, costBasis, gainAbs, gainPct, dayChangePct, priceInBase, isStale, isFund, priceRow };
+  return { currentValue, costBasis, gainAbs, gainPct, dayChangePct, priceReturnPct, fxReturnPct, priceInBase, isStale, isFund, priceRow };
 }
 
 async function loadHoldings() {
@@ -268,12 +406,17 @@ async function loadHoldings() {
   const priceCurrencies = Object.values(prices).map((p) => p.currency);
   const missing = priceCurrencies.filter((c) => !(c in fxRates));
   if (missing.length) Object.assign(fxRates, await fetchLatestFx(missing).catch(() => ({})));
+  // Day 24: previous FX snapshot for every currency a price might come back
+  // in, purely for the price-vs-FX return split below (see computeRow) —
+  // best-effort, missing entries just mean that holding's split falls back
+  // to price-only day change.
+  const fxRatesYesterday = await fetchPreviousFx([...new Set([...currencies, ...priceCurrencies])]).catch(() => ({}));
 
   // Computed over EVERY holding regardless of the portfolio filter — the
   // whole-account total feeds the "All portfolios" chart view below.
   const allRows = holdings.map((h) => ({
     h,
-    ...computeRow(h, prices[h.ticker], fxRates, buyFxByHolding.get(`${h.buy_currency}|${h.buy_date}`)),
+    ...computeRow(h, prices[h.ticker], fxRates, buyFxByHolding.get(`${h.buy_currency}|${h.buy_date}`), fxRatesYesterday),
   }));
   const wholeAccountValue = allRows.reduce((s, r) => s + (r.currentValue || 0), 0);
   // Cost basis (Day 22, for the chart's "total buy-in" line) doesn't depend
@@ -457,8 +600,29 @@ function renderHoldingsTable() {
 
   const portfolioNameById = Object.fromEntries(allPortfolios.map((p) => [p.id, p.name]));
 
+  // Day 24 (review P1: "duplicate/un-aggregated holdings"). Adding/editing a
+  // holding already auto-merges same-ticker rows when portfolio AND currency
+  // both match exactly (see weightedMerge, Day 16) — but a ticker split
+  // across different portfolios or currencies is a real, deliberate case the
+  // app supports and doesn't (and shouldn't) silently combine. What was
+  // missing was any visibility that it's happening at all. This groups the
+  // currently-displayed rows by ticker and flags every ticker appearing more
+  // than once with a small "×N lots" badge, hover-explained.
+  const tickerGroups = {};
+  for (const r of rows) (tickerGroups[r.h.ticker] ??= []).push(r);
+
   tbody.innerHTML = rows
-    .map(({ h, currentValue, gainPct, dayChangePct, priceInBase, isStale, isFund, priceRow }) => {
+    .map(({ h, currentValue, gainPct, dayChangePct, priceReturnPct, fxReturnPct, priceInBase, isStale, isFund, priceRow }) => {
+      const lots = tickerGroups[h.ticker];
+      const lotBadge =
+        lots.length > 1
+          ? (() => {
+              const breakdown = lots
+                .map((r) => `${r.h.quantity} @ ${fmtMoneyIn(r.h.buy_price, r.h.buy_currency)} (${r.h.portfolio_id ? portfolioNameById[r.h.portfolio_id] || "—" : "unassigned"})`)
+                .join("; ");
+              return ` <span class="lot-badge" title="${escapeHtml(h.ticker)} is split across ${lots.length} lots — ${escapeHtml(breakdown)}">×${lots.length} lots</span>`;
+            })()
+          : "";
       // Day 23 (a11y/UX review, "no data-source attribution/freshness"): the
       // "stale" flag alone doesn't say WHEN a price is from — this title
       // gives the exact fetch timestamp per row on hover/focus, not just a
@@ -466,16 +630,26 @@ function renderHoldingsTable() {
       const asOfTitle = priceRow?.as_of
         ? `Price as of ${new Date(priceRow.as_of).toLocaleString()} · Source: Twelve Data`
         : "No price data yet";
+      // Day 24 (review P1: "gain/loss blends price & FX return") — a hover
+      // title breaking the blended Day Δ % into its two components. Only
+      // worth showing when there's an actual FX component to isolate (a
+      // base-currency holding has fxReturnPct === 0 by definition).
+      const dayChangeTitle =
+        fxReturnPct != null && fxReturnPct !== 0
+          ? `Price: ${fmtPct(priceReturnPct)} · FX: ${fmtPct(fxReturnPct)}`
+          : priceReturnPct != null
+            ? `Price: ${fmtPct(priceReturnPct)} (no FX component)`
+            : "";
       return `
     <tr>
-      <td>${h.ticker}</td>
+      <td>${h.ticker}${lotBadge}</td>
       <td>${h.portfolio_id ? escapeHtml(portfolioNameById[h.portfolio_id] || "—") : '<span class="nav-tag">unassigned</span>'}</td>
       <td>${h.asset_type}</td>
       <td>${h.quantity}</td>
       <td>${fmtMoneyIn(h.buy_price, h.buy_currency)}</td>
       <td title="${escapeHtml(asOfTitle)}">${priceInBase != null ? fmtMoney(priceInBase) : "—"}${isFund ? '<span class="nav-tag">NAV</span>' : ""}${isStale ? '<span class="stale">stale</span>' : ""}</td>
       <td>${fmtMoney(currentValue)}</td>
-      <td class="${pctClass(dayChangePct)}">${fmtPct(dayChangePct)}</td>
+      <td class="${pctClass(dayChangePct)}"${dayChangeTitle ? ` title="${escapeHtml(dayChangeTitle)}"` : ""}>${fmtPct(dayChangePct)}</td>
       <td class="${pctClass(gainPct)}">${fmtPct(gainPct)}</td>
       <td>${totalValue ? fmtPct((currentValue / totalValue) * 100).replace("+", "") : "—"}</td>
       <td>
@@ -499,6 +673,19 @@ function renderHoldingsTable() {
       });
       if (!ok) return;
       await sb.from("holdings").delete().eq("id", btn.dataset.id);
+      if (target) {
+        logTransaction({
+          holdingId: target.id,
+          portfolioId: target.portfolio_id,
+          ticker: target.ticker,
+          eventType: "delete",
+          quantity: target.quantity,
+          price: target.buy_price,
+          currency: target.buy_currency,
+          eventDate: new Date().toISOString().slice(0, 10),
+          notes: "Deleted (not a sale) — no realized gain recorded.",
+        });
+      }
       loadHoldings();
     })
   );
@@ -999,9 +1186,25 @@ document.getElementById("sellForm").addEventListener("submit", async (e) => {
       .eq("id", sellingHolding.id);
   }
 
+  logTransaction({
+    holdingId: sellingHolding.id,
+    portfolioId: sellingHolding.portfolio_id,
+    ticker: sellingHolding.ticker,
+    eventType: "sell",
+    quantity: sellQuantity,
+    price: sellPrice,
+    currency: sellCurrency,
+    eventDate: sellDate,
+    notes:
+      realizedGainAbs != null
+        ? `Realized ${realizedGainAbs >= 0 ? "gain" : "loss"} of ${fmtMoney(realizedGainAbs)} (${fmtPct(realizedGainPct)}).`
+        : null,
+  });
+
   stopSell();
   loadHoldings();
   loadRealizedGains();
+  loadTransactions();
 });
 
 // Day 11-style "Could" addition: a record of every closed position, not just
@@ -1049,6 +1252,48 @@ async function loadRealizedGains() {
       <td>${fmtMoneyIn(r.sell_price, r.sell_currency)}</td>
       <td>${new Date(r.sell_date).toLocaleDateString()}</td>
       <td class="${pctClass(r.realized_gain_abs)}">${r.realized_gain_abs != null ? fmtMoney(r.realized_gain_abs) : "—"}${r.realized_gain_pct != null ? ` (${fmtPct(r.realized_gain_pct)})` : ""}</td>
+    </tr>`
+    )
+    .join("");
+}
+
+// Day 24 (review P1: "no transaction ledger / audit history"). Read-only —
+// every row here comes from logTransaction() calls at the actual mutation
+// points (add/edit/merge/sell/delete/import); this table never writes
+// anything itself, same as Realized Gains above.
+let lastTransactionRows = [];
+const EVENT_TYPE_LABELS = { buy: "Buy", sell: "Sell", edit: "Edit", merge: "Merge", delete: "Delete", import: "Import" };
+
+async function loadTransactions() {
+  const tbody = document.getElementById("transactionsBody");
+  if (!tbody) return;
+  const { data, error } = await sb
+    .from("transactions")
+    .select("*")
+    .order("event_date", { ascending: false })
+    .order("created_at", { ascending: false })
+    .limit(200);
+
+  if (error) {
+    tbody.innerHTML = `<tr><td colspan="6">Could not load transaction history: ${error.message}</td></tr>`;
+    return;
+  }
+  lastTransactionRows = data || [];
+  if (!data || data.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="6">No recorded activity yet — every buy, edit, sell, delete, and import will show up here.</td></tr>`;
+    return;
+  }
+
+  tbody.innerHTML = data
+    .map(
+      (r) => `
+    <tr>
+      <td>${new Date(r.event_date).toLocaleDateString()}</td>
+      <td><span class="event-tag event-tag-${escapeHtml(r.event_type)}">${escapeHtml(EVENT_TYPE_LABELS[r.event_type] || r.event_type)}</span></td>
+      <td>${escapeHtml(r.ticker)}</td>
+      <td>${r.quantity ?? "—"}</td>
+      <td>${r.price != null && r.currency ? fmtMoneyIn(r.price, r.currency) : "—"}</td>
+      <td>${r.notes ? escapeHtml(r.notes) : "—"}</td>
     </tr>`
     )
     .join("");
@@ -1116,6 +1361,302 @@ document.getElementById("exportRealizedGainsBtn").addEventListener("click", () =
     { label: "Realized gain %", value: (r) => r.realized_gain_pct ?? "" },
   ];
   downloadCsv(`realized_gains_${new Date().toISOString().slice(0, 10)}.csv`, toCsv(lastRealizedGainsRows, columns));
+});
+
+document.getElementById("exportTransactionsBtn")?.addEventListener("click", () => {
+  if (!lastTransactionRows.length) return;
+  const columns = [
+    { label: "Date", value: (r) => r.event_date },
+    { label: "Event", value: (r) => EVENT_TYPE_LABELS[r.event_type] || r.event_type },
+    { label: "Ticker", value: (r) => r.ticker },
+    { label: "Quantity", value: (r) => r.quantity ?? "" },
+    { label: "Price", value: (r) => r.price ?? "" },
+    { label: "Currency", value: (r) => r.currency ?? "" },
+    { label: "Notes", value: (r) => r.notes ?? "" },
+  ];
+  downloadCsv(`transaction_history_${new Date().toISOString().slice(0, 10)}.csv`, toCsv(lastTransactionRows, columns));
+});
+
+// --- CSV import (Day 24, review P1: "no import") --------------------------
+// Symmetric with Export CSV: same column set (Ticker/Portfolio/Type/
+// Quantity/Buy price/Buy currency/Buy date — the computed columns Export
+// also writes, like Current price/Value/Gain-loss %, are simply ignored on
+// the way back in). Header matching is case-insensitive with a few common
+// aliases per column (symbol/qty/shares/etc.) so a reasonably-shaped export
+// from elsewhere has a decent chance of working too, without hand-coding
+// any specific broker's exact format.
+function parseCsv(text) {
+  const rows = [];
+  let row = [];
+  let field = "";
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') {
+          field += '"';
+          i++;
+        } else inQuotes = false;
+      } else {
+        field += c;
+      }
+    } else if (c === '"') {
+      inQuotes = true;
+    } else if (c === ",") {
+      row.push(field);
+      field = "";
+    } else if (c === "\n" || c === "\r") {
+      if (c === "\r" && text[i + 1] === "\n") i++;
+      row.push(field);
+      field = "";
+      rows.push(row);
+      row = [];
+    } else {
+      field += c;
+    }
+  }
+  if (field.length || row.length) {
+    row.push(field);
+    rows.push(row);
+  }
+  return rows.filter((r) => r.some((c) => c.trim() !== ""));
+}
+
+const IMPORT_HEADER_ALIASES = {
+  ticker: ["ticker", "symbol"],
+  portfolio: ["portfolio"],
+  asset_type: ["type", "asset_type", "asset type"],
+  quantity: ["quantity", "qty", "shares"],
+  buy_price: ["buy price", "price", "buy_price", "cost", "cost basis"],
+  buy_currency: ["buy currency", "currency", "buy_currency"],
+  buy_date: ["buy date", "date", "buy_date", "purchase date"],
+};
+
+document.getElementById("importHoldingsBtn").addEventListener("click", () => {
+  document.getElementById("importHoldingsFile").click();
+});
+
+document.getElementById("importHoldingsFile").addEventListener("change", async (e) => {
+  const file = e.target.files[0];
+  const statusEl = document.getElementById("importStatus");
+  e.target.value = ""; // reset so re-selecting the same file still fires "change"
+  if (!file) return;
+  if (!currentUserId) {
+    statusEl.className = "import-status negative";
+    statusEl.textContent = "Not signed in — please sign in again.";
+    return;
+  }
+
+  statusEl.className = "import-status";
+  statusEl.textContent = "Reading file…";
+
+  let text;
+  try {
+    text = await file.text();
+  } catch (err) {
+    statusEl.className = "import-status negative";
+    statusEl.textContent = `Could not read file: ${err.message}`;
+    return;
+  }
+
+  const rows = parseCsv(text);
+  if (rows.length < 2) {
+    statusEl.className = "import-status negative";
+    statusEl.textContent = "No data rows found in that file.";
+    return;
+  }
+
+  const header = rows[0].map((h) => h.trim().toLowerCase());
+  const colIndex = {};
+  for (const [field, aliases] of Object.entries(IMPORT_HEADER_ALIASES)) {
+    const idx = header.findIndex((h) => aliases.includes(h));
+    if (idx !== -1) colIndex[field] = idx;
+  }
+  if (colIndex.ticker == null || colIndex.quantity == null || colIndex.buy_price == null) {
+    statusEl.className = "import-status negative";
+    statusEl.textContent = 'CSV needs at least "Ticker", "Quantity", and "Buy price" columns (matches the Export CSV format).';
+    return;
+  }
+
+  statusEl.textContent = "Importing…";
+
+  let imported = 0;
+  let merged = 0;
+  let skipped = 0;
+  const errors = [];
+  const portfolioIdByName = {}; // cache within this one import run
+
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    const ticker = (r[colIndex.ticker] || "").trim().toUpperCase();
+    const quantity = Number(r[colIndex.quantity]);
+    const buyPrice = Number(r[colIndex.buy_price]);
+    const assetTypeRaw = colIndex.asset_type != null ? (r[colIndex.asset_type] || "").trim().toLowerCase() : "stock";
+    const assetType = ["stock", "etf", "fund"].includes(assetTypeRaw) ? assetTypeRaw : "stock";
+    const buyCurrency = (colIndex.buy_currency != null ? (r[colIndex.buy_currency] || "").trim().toUpperCase() : "") || BASE_CURRENCY;
+    const buyDateRaw = colIndex.buy_date != null ? (r[colIndex.buy_date] || "").trim() : "";
+    const buyDate = /^\d{4}-\d{2}-\d{2}$/.test(buyDateRaw) ? buyDateRaw : null;
+    const portfolioName = colIndex.portfolio != null ? (r[colIndex.portfolio] || "").trim() : "";
+
+    if (!ticker || !(quantity > 0) || !(buyPrice > 0) || !buyDate) {
+      skipped++;
+      errors.push(`Row ${i + 1}: missing/invalid ticker, quantity, buy price, or buy date (expects YYYY-MM-DD).`);
+      continue;
+    }
+
+    let portfolioId = null;
+    if (portfolioName) {
+      const key = portfolioName.toLowerCase();
+      if (!(key in portfolioIdByName)) {
+        const existingP = allPortfolios.find((p) => p.name.toLowerCase() === key);
+        if (existingP) {
+          portfolioIdByName[key] = existingP.id;
+        } else {
+          const { data: newP, error: pErr } = await sb.from("portfolios").insert({ user_id: currentUserId, name: portfolioName }).select().single();
+          if (pErr) {
+            errors.push(`Row ${i + 1}: could not create portfolio "${portfolioName}": ${pErr.message}`);
+            portfolioIdByName[key] = null;
+          } else {
+            portfolioIdByName[key] = newP.id;
+            allPortfolios.push(newP);
+          }
+        }
+      }
+      portfolioId = portfolioIdByName[key];
+    }
+
+    const payload = { ticker, asset_type: assetType, quantity, buy_price: buyPrice, buy_currency: buyCurrency, buy_date: buyDate, portfolio_id: portfolioId };
+
+    const sameTicker = await findSameTickerHoldings(ticker, portfolioId, null);
+    const existing = sameTicker.find((h) => h.buy_currency === buyCurrency);
+    if (existing) {
+      const mergedRow = weightedMerge(existing, payload);
+      const { error } = await sb.from("holdings").update(mergedRow).eq("id", existing.id);
+      if (error) {
+        skipped++;
+        errors.push(`Row ${i + 1} (${ticker}): ${error.message}`);
+        continue;
+      }
+      merged++;
+      logTransaction({
+        holdingId: existing.id,
+        portfolioId,
+        ticker,
+        eventType: "import",
+        quantity,
+        price: buyPrice,
+        currency: buyCurrency,
+        eventDate: buyDate,
+        notes: "Imported via CSV — merged into an existing lot.",
+      });
+    } else {
+      payload.user_id = currentUserId;
+      const { error } = await sb.from("holdings").insert(payload);
+      if (error) {
+        skipped++;
+        errors.push(`Row ${i + 1} (${ticker}): ${error.message}`);
+        continue;
+      }
+      imported++;
+      logTransaction({ portfolioId, ticker, eventType: "import", quantity, price: buyPrice, currency: buyCurrency, eventDate: buyDate });
+    }
+  }
+
+  statusEl.className = imported + merged > 0 ? "import-status positive" : "import-status negative";
+  let summary = `Imported ${imported} new, merged ${merged}, skipped ${skipped}.`;
+  if (errors.length) summary += ` First issue: ${errors[0]}`;
+  statusEl.textContent = summary;
+
+  await loadPortfolios();
+  loadTransactions();
+  await triggerPriceRefresh();
+  loadHoldings();
+});
+
+// --- Account: data export + self-serve deletion (Day 24) -----------------
+function downloadJson(filename, obj) {
+  const blob = new Blob([JSON.stringify(obj, null, 2)], { type: "application/json;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+document.getElementById("exportAllDataBtn").addEventListener("click", async (e) => {
+  const btn = e.currentTarget;
+  const errEl = document.getElementById("accountError");
+  const hintEl = document.getElementById("accountHint");
+  errEl.textContent = "";
+  hintEl.textContent = "";
+  btn.disabled = true;
+  const originalText = btn.textContent;
+  btn.textContent = "Exporting…";
+  try {
+    // Every query below is scoped to this account by RLS (auth.uid() =
+    // user_id) exactly like the rest of the app — no extra filtering needed
+    // here, same guarantee already verified live (Day 23, S-2).
+    const tables = ["holdings", "portfolios", "realized_gains", "transactions", "portfolio_value_history", "portfolio_history"];
+    const results = await Promise.all(tables.map((t) => sb.from(t).select("*")));
+    const bundle = { exported_at: new Date().toISOString(), base_currency: BASE_CURRENCY };
+    tables.forEach((t, i) => {
+      if (results[i].error) throw new Error(`${t}: ${results[i].error.message}`);
+      bundle[t] = results[i].data;
+    });
+    downloadJson(`portfolio_tracker_export_${new Date().toISOString().slice(0, 10)}.json`, bundle);
+    hintEl.textContent = "Export downloaded.";
+  } catch (err) {
+    errEl.textContent = `Export failed: ${err.message}`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = originalText;
+  }
+});
+
+document.getElementById("deleteAccountBtn").addEventListener("click", async (e) => {
+  const btn = e.currentTarget;
+  const errEl = document.getElementById("accountError");
+  const hintEl = document.getElementById("accountHint");
+  errEl.textContent = "";
+  hintEl.textContent = "";
+
+  const typed = await showModal({
+    type: "prompt",
+    title: "Delete your account?",
+    message:
+      'This permanently deletes your account and ALL of your data — holdings, portfolios, realized gains, transaction history, and value history. This cannot be undone. Type DELETE to confirm.',
+    placeholder: "DELETE",
+    danger: true,
+    confirmLabel: "Delete my account",
+  });
+  if (typed == null) return; // cancelled
+  if (typed !== "DELETE") {
+    errEl.textContent = 'Account not deleted — you need to type "DELETE" exactly to confirm.';
+    return;
+  }
+  if (!window.WORKER_URL) {
+    errEl.textContent = "Can't reach the Worker (WORKER_URL not configured) — account not deleted.";
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = "Deleting…";
+  try {
+    const res = await authedFetch(`${window.WORKER_URL}/delete-account`, { method: "POST" });
+    const result = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(result.error || `HTTP ${res.status}`);
+    await sb.auth.signOut();
+    showLogin();
+    document.getElementById("loginHint").textContent = "Your account and all associated data have been deleted.";
+  } catch (err) {
+    errEl.textContent = `Could not delete account: ${err.message}`;
+    btn.disabled = false;
+    btn.textContent = "Delete my account";
+  }
 });
 
 // --- Portfolios: an optional grouping layer on top of holdings ------------
@@ -1338,6 +1879,35 @@ tickerInputEl.addEventListener("blur", () => {
   setTimeout(() => renderTickerSuggestions([]), 150); // delay so a click on a suggestion still registers
 });
 
+// Day 24 (review P1: duplicate/un-aggregated holdings) — warn on blur if
+// this ticker already exists under a different portfolio/currency, so it's
+// clear BEFORE submitting that this will land as a separate lot rather than
+// merge (see weightedMerge/findSameTickerHoldings, which only auto-merge on
+// an EXACT ticker+portfolio+currency match). Reads from the already-loaded
+// lastHoldingsRows — no extra round trip.
+tickerInputEl.addEventListener("blur", () => {
+  const hintEl = document.getElementById("tickerDuplicateHint");
+  const ticker = tickerInputEl.value.trim().toUpperCase();
+  if (!ticker) {
+    hintEl.textContent = "";
+    return;
+  }
+  const portfolioId = document.getElementById("portfolioFormSelect").value || null;
+  const buyCurrency = document.querySelector('#holdingForm select[name="buy_currency"]')?.value;
+  const others = lastHoldingsRows.filter(
+    (r) => r.h.ticker === ticker && r.h.id !== editingHoldingId && !(r.h.portfolio_id === portfolioId && r.h.buy_currency === buyCurrency)
+  );
+  if (others.length) {
+    const portfolioNameById = Object.fromEntries(allPortfolios.map((p) => [p.id, p.name]));
+    const breakdown = others
+      .map((r) => `${r.h.quantity} @ ${fmtMoneyIn(r.h.buy_price, r.h.buy_currency)} in ${r.h.portfolio_id ? portfolioNameById[r.h.portfolio_id] || "—" : "unassigned"}`)
+      .join("; ");
+    hintEl.textContent = `You already hold ${ticker} elsewhere (${breakdown}) — this will be added as a separate lot, not merged, since the portfolio/currency don't match exactly.`;
+  } else {
+    hintEl.textContent = "";
+  }
+});
+
 // --- Manual "Run now" button ------------------------------------------------
 // Wires the Worker's /run?user_id= endpoint (scoped to just this user — see
 // worker/src/index.js runDailyJobForUser) to a button instead of requiring
@@ -1475,6 +2045,7 @@ document.getElementById("holdingForm").addEventListener("submit", async (e) => {
   if (!(payload.buy_price > 0)) return (errEl.textContent = "Buy price must be positive.");
 
   if (editingHoldingId) {
+    const before = window.__holdingsById?.[editingHoldingId] || null;
     const sameTicker = await findSameTickerHoldings(payload.ticker, payload.portfolio_id, editingHoldingId);
     const collision = sameTicker.find((h) => h.buy_currency === payload.buy_currency);
 
@@ -1493,6 +2064,17 @@ document.getElementById("holdingForm").addEventListener("submit", async (e) => {
         errEl.textContent = `Merged, but could not remove the old duplicate row: ${delError.message}`;
       } else {
         statusEl.textContent = `Merged into your existing ${payload.ticker} position — now ${merged.quantity} @ weighted avg ${fmtMoneyIn(merged.buy_price, payload.buy_currency)}.`;
+        logTransaction({
+          holdingId: collision.id,
+          portfolioId: payload.portfolio_id,
+          ticker: payload.ticker,
+          eventType: "edit",
+          quantity: payload.quantity,
+          price: payload.buy_price,
+          currency: payload.buy_currency,
+          eventDate: payload.buy_date,
+          notes: `Edited and merged into an existing lot — now ${merged.quantity} @ weighted avg ${fmtMoneyIn(merged.buy_price, payload.buy_currency)}.`,
+        });
       }
     } else {
       const { error } = await sb.from("holdings").update(payload).eq("id", editingHoldingId);
@@ -1503,12 +2085,26 @@ document.getElementById("holdingForm").addEventListener("submit", async (e) => {
       if (sameTicker.length) {
         statusEl.textContent = `Saved as its own row — an existing ${payload.ticker} holding in this portfolio is in ${sameTicker[0].buy_currency}, so it wasn't merged.`;
       }
+      logTransaction({
+        holdingId: editingHoldingId,
+        portfolioId: payload.portfolio_id,
+        ticker: payload.ticker,
+        eventType: "edit",
+        quantity: payload.quantity,
+        price: payload.buy_price,
+        currency: payload.buy_currency,
+        eventDate: payload.buy_date,
+        notes: before
+          ? `Changed from ${before.quantity} @ ${fmtMoneyIn(before.buy_price, before.buy_currency)} (${before.buy_date}) to ${payload.quantity} @ ${fmtMoneyIn(payload.buy_price, payload.buy_currency)} (${payload.buy_date}).`
+          : null,
+      });
     }
     stopEdit();
     e.target.reset();
     setDateToToday();
     setPortfolioFormDefault();
     loadHoldings();
+    loadTransactions();
     await triggerPriceRefresh(); // ticker may have changed
     loadHoldings();
     return;
@@ -1527,6 +2123,17 @@ document.getElementById("holdingForm").addEventListener("submit", async (e) => {
       return;
     }
     statusEl.textContent = `Merged into your existing ${payload.ticker} position — now ${merged.quantity} @ weighted avg ${fmtMoneyIn(merged.buy_price, payload.buy_currency)}.`;
+    logTransaction({
+      holdingId: existing.id,
+      portfolioId: payload.portfolio_id,
+      ticker: payload.ticker,
+      eventType: "buy",
+      quantity: payload.quantity,
+      price: payload.buy_price,
+      currency: payload.buy_currency,
+      eventDate: payload.buy_date,
+      notes: `Merged into an existing lot — now ${merged.quantity} @ weighted avg ${fmtMoneyIn(merged.buy_price, payload.buy_currency)}.`,
+    });
   } else {
     const { error } = await sb.from("holdings").insert(payload);
     if (error) {
@@ -1536,12 +2143,22 @@ document.getElementById("holdingForm").addEventListener("submit", async (e) => {
     if (sameTicker.length) {
       statusEl.textContent = `Added as its own row — an existing ${payload.ticker} holding in this portfolio is in ${sameTicker[0].buy_currency}, so it wasn't merged.`;
     }
+    logTransaction({
+      portfolioId: payload.portfolio_id,
+      ticker: payload.ticker,
+      eventType: "buy",
+      quantity: payload.quantity,
+      price: payload.buy_price,
+      currency: payload.buy_currency,
+      eventDate: payload.buy_date,
+    });
   }
 
   e.target.reset();
   setDateToToday(); // form.reset() clears the date field back to blank — refill it
   setPortfolioFormDefault(); // form.reset() also clears this back to "No portfolio" — refill from the active filter
   loadHoldings(); // show the new/merged row immediately (price will say "no data" until the refresh below lands)
+  loadTransactions();
   await triggerPriceRefresh();
   loadHoldings(); // reload once the Worker has cached a price for the new ticker
 });
@@ -1600,6 +2217,7 @@ function showApp(user) {
   loadPortfolios().then(loadHoldings);
   loadValueHistory();
   loadRealizedGains();
+  loadTransactions();
   if (!window.__pollingStarted) {
     window.__pollingStarted = true;
     setInterval(() => {
@@ -1607,6 +2225,7 @@ function showApp(user) {
       loadHoldings();
       loadValueHistory();
       loadRealizedGains();
+      loadTransactions();
     }, 5 * 60 * 1000); // refresh the view every 5 min from cache (not the API)
   }
 }
@@ -1668,6 +2287,41 @@ document.getElementById("toggleSignupBtn").addEventListener("click", () => {
   passwordInput.autocomplete = nowSignup ? "new-password" : "current-password";
 });
 
+// Day 24 (review P1: "generic auth errors; enable rate limits"). Two parts:
+//
+// 1. sanitizeAuthError masks the one genuinely enumeration-relevant message
+//    Supabase returns in this project's configuration (email confirmation
+//    is OFF, so signUp on an already-registered email returns an explicit
+//    error rather than the silent no-op Supabase uses when confirmation is
+//    on) — without this, someone could probe arbitrary emails against
+//    /signup and learn who has an account here just from the error text.
+//    Genuinely useful messages (weak password, malformed email, wrong
+//    credentials) pass through unchanged — those aren't enumeration risks
+//    and hiding them would just make the form worse to use.
+//
+// 2. A client-side attempt throttle on THIS form — not a substitute for
+//    real server-side rate limiting (that's enforced by Supabase Auth
+//    itself, which applies default per-project rate limits to sign-in/
+//    sign-up regardless of what this app does), but real defense-in-depth
+//    against a script hammering this one browser tab. State is in-memory
+//    only (resets on reload) — see README for what this does and doesn't
+//    cover, including why a full CAPTCHA integration wasn't added here.
+function sanitizeAuthError(message) {
+  const lower = (message || "").toLowerCase();
+  if (lower.includes("already registered") || lower.includes("already exists") || lower.includes("user already")) {
+    return "Could not create an account with those details. If you already have one, try signing in instead.";
+  }
+  if (lower.includes("rate limit") || lower.includes("too many")) {
+    return "Too many attempts — please wait a bit before trying again.";
+  }
+  return message;
+}
+
+const LOGIN_THROTTLE_WINDOW_MS = 5 * 60 * 1000;
+const LOGIN_THROTTLE_MAX_ATTEMPTS = 5;
+const LOGIN_THROTTLE_COOLDOWN_MS = 60 * 1000;
+let loginFailureTimestamps = [];
+
 document.getElementById("loginForm").addEventListener("submit", async (e) => {
   e.preventDefault();
   const errEl = document.getElementById("loginError");
@@ -1676,15 +2330,32 @@ document.getElementById("loginForm").addEventListener("submit", async (e) => {
   hintEl.textContent = "";
   if (!showValidationError(e.target, errEl)) return;
 
+  const now = Date.now();
+  loginFailureTimestamps = loginFailureTimestamps.filter((t) => now - t < LOGIN_THROTTLE_WINDOW_MS);
+  if (loginFailureTimestamps.length >= LOGIN_THROTTLE_MAX_ATTEMPTS) {
+    const oldestInWindow = loginFailureTimestamps[0];
+    const waitMs = LOGIN_THROTTLE_COOLDOWN_MS - (now - oldestInWindow);
+    if (waitMs > 0) {
+      errEl.textContent = `Too many attempts — please wait ${Math.ceil(waitMs / 1000)}s before trying again.`;
+      return;
+    }
+  }
+
   const form = new FormData(e.target);
   const email = form.get("email");
   const password = form.get("password");
   const action = form.get("action"); // set by the Sign in/Sign up toggle link
 
+  // Day 24: write the "remember me" preference BEFORE signing in, so
+  // rememberMeStorage (see top of file) already knows which backing store to
+  // use by the time Supabase's client writes the resulting session token.
+  localStorage.setItem(REMEMBER_ME_KEY, form.get("remember") ? "true" : "false");
+
   if (action === "signup") {
     const { data, error } = await sb.auth.signUp({ email, password });
     if (error) {
-      errEl.textContent = error.message;
+      loginFailureTimestamps.push(Date.now());
+      errEl.textContent = sanitizeAuthError(error.message);
       return;
     }
     if (data.session) {
@@ -1700,9 +2371,11 @@ document.getElementById("loginForm").addEventListener("submit", async (e) => {
 
   const { data, error } = await sb.auth.signInWithPassword({ email, password });
   if (error) {
-    errEl.textContent = error.message;
+    loginFailureTimestamps.push(Date.now());
+    errEl.textContent = sanitizeAuthError(error.message);
     return;
   }
+  loginFailureTimestamps = []; // successful sign-in clears the count
   showApp(data.user);
 });
 
@@ -1761,7 +2434,7 @@ document.getElementById("forgotPasswordForm").addEventListener("submit", async (
   // should let someone infer whether a given email has an account.
   if (error) {
     // Only network/rate-limit-type failures should reach here in practice.
-    errEl.textContent = error.message;
+    errEl.textContent = sanitizeAuthError(error.message);
     return;
   }
   hintEl.textContent = "If an account exists for that email, we've sent a link to reset your password. Check your inbox.";

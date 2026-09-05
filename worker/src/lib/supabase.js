@@ -53,6 +53,19 @@ export function makeSupabase(env) {
     insertRows: (table, rows) =>
       req(`/${table}`, { method: "POST", headers: { Prefer: "return=minimal" }, body: JSON.stringify(rows) }),
 
+    // Day 24 (review P1: self-serve account deletion). GoTrue admin endpoint
+    // that deletes the auth.users row itself — every user-scoped table
+    // (holdings, portfolios, realized_gains, transactions, etc.) has
+    // `references auth.users (id) on delete cascade`, so this one call is
+    // enough to remove every trace of the account across the whole schema.
+    // Only the service_role key can call this (never exposed to the browser).
+    deleteUser: async (id) => {
+      const res = await fetch(`${env.SUPABASE_URL}/auth/v1/admin/users/${id}`, { method: "DELETE", headers: authHeaders });
+      if (!res.ok && res.status !== 404) {
+        throw new Error(`Supabase admin deleteUser failed: ${res.status} ${await res.text().catch(() => "")}`);
+      }
+    },
+
     // Most recent FX snapshot strictly before `beforeIso` — used to separate
     // FX return from price return (Day 12).
     getFxRateBefore: async (base_, quote, beforeIso) => {
