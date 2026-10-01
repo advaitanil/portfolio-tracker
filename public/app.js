@@ -1270,6 +1270,73 @@ function computeBenchmarkOverlay(points) {
   });
 }
 
+// Day 26 ("Benchmark overlay" follow-up): real alpha/tracking-error stats,
+// not just a visual line. Methodology, stated plainly so it's never
+// mis-described as more than it is:
+//   - Per-period portfolio return uses the SAME cash-flow-adjusted method
+//     as computeTWR above (backs each period's change in cost basis out of
+//     the value change, so a buy/sell doesn't masquerade as market return).
+//   - Per-period benchmark return is a plain price return on the rebased
+//     overlay series from computeBenchmarkOverlay — no cash flows to back
+//     out of a single ticker's own price series.
+//   - "Alpha" here is SIMPLE/EXCESS-RETURN alpha: the portfolio's annualized
+//     return minus the benchmark's, both computed from the same linked
+//     per-period returns. This is NOT Jensen's alpha / CAPM alpha — that
+//     needs a risk-free rate and a beta regression against the benchmark,
+//     neither of which this app computes. Don't describe it as CAPM alpha;
+//     describe it as excess return over the benchmark.
+//   - Tracking error is the annualized standard deviation of the per-period
+//     return DIFFERENCE (portfolio minus benchmark) — the standard
+//     definition, just computed over whatever period length the plotted
+//     points happen to be spaced at (see periodsPerYear below), since the
+//     chart can be showing daily, weekly, or multi-day-spaced points
+//     depending on the selected range and how much downsampling applied.
+// Needs at least 3 usable points (2 periods) to produce a standard
+// deviation at all; returns null rather than a misleading number below that.
+function computeAlphaTrackingError(points, benchmarkValues) {
+  if (!points || !benchmarkValues || points.length < 3) return null;
+
+  const portfolioReturns = [];
+  const benchmarkReturns = [];
+  const periodDaysList = [];
+  for (let i = 1; i < points.length; i++) {
+    const prev = points[i - 1];
+    const curr = points[i];
+    const bPrev = benchmarkValues[i - 1];
+    const bCurr = benchmarkValues[i];
+    if (bPrev == null || bCurr == null || !prev.total_value || prev.total_value <= 0 || !bPrev) continue;
+    const cf = curr.total_cost != null && prev.total_cost != null ? curr.total_cost - prev.total_cost : 0;
+    const rp = (curr.total_value - cf - prev.total_value) / prev.total_value;
+    const rb = (bCurr - bPrev) / bPrev;
+    if (!Number.isFinite(rp) || !Number.isFinite(rb)) continue;
+    portfolioReturns.push(rp);
+    benchmarkReturns.push(rb);
+    const days = (new Date(curr.date) - new Date(prev.date)) / 86400000;
+    if (days > 0) periodDaysList.push(days);
+  }
+
+  if (portfolioReturns.length < 2 || !periodDaysList.length) return null;
+
+  const n = portfolioReturns.length;
+  const excessReturns = portfolioReturns.map((r, i) => r - benchmarkReturns[i]);
+  const meanExcess = excessReturns.reduce((s, v) => s + v, 0) / n;
+  // Sample standard deviation (n-1 denominator) — standard choice when
+  // treating these periods as a sample rather than the full population.
+  const variance = excessReturns.reduce((s, v) => s + (v - meanExcess) ** 2, 0) / (n - 1);
+  const stdevExcess = Math.sqrt(variance);
+
+  const avgPeriodDays = periodDaysList.reduce((s, v) => s + v, 0) / periodDaysList.length;
+  const periodsPerYear = 365.25 / avgPeriodDays;
+
+  const trackingErrorPct = stdevExcess * Math.sqrt(periodsPerYear) * 100;
+  // Compounds the mean per-period excess return up to an annual figure —
+  // consistent with how computeTWR links per-period returns, just applied
+  // to the EXCESS (portfolio minus benchmark) return instead of the raw one.
+  const alphaPct = (Math.pow(1 + meanExcess, periodsPerYear) - 1) * 100;
+
+  return { alphaPct, trackingErrorPct, periods: n };
+}
+
 function renderValueChart(svg, rawPoints) {
   const points = downsample(rawPoints, 90);
   const width = 700;
@@ -1283,6 +1350,23 @@ function renderValueChart(svg, rawPoints) {
     benchmarkLegendItem.style.display = benchmarkValues ? "" : "none";
     const label = document.getElementById("benchmarkLegendLabel");
     if (label) label.textContent = `${benchmarkTicker} (indexed to your starting value)`;
+  }
+
+  const statsLine = document.getElementById("benchmarkStatsLine");
+  if (statsLine) {
+    const stats = benchmarkValues ? computeAlphaTrackingError(points, benchmarkValues) : null;
+    if (stats) {
+      statsLine.style.display = "";
+      statsLine.className = "benchmark-stats-line " + pctClass(stats.alphaPct);
+      statsLine.title =
+        "Alpha here is simple excess return (portfolio return minus benchmark return, annualized) — not a CAPM/Jensen's alpha, which would also need a risk-free rate and a beta regression. Tracking error is the annualized standard deviation of that return difference. Both computed from " +
+        stats.periods +
+        " periods over the currently selected date range.";
+      statsLine.textContent = `vs. ${benchmarkTicker}: alpha ${fmtPct(stats.alphaPct)} (annualized) · tracking error ${stats.trackingErrorPct.toFixed(2)}% ⓘ`;
+    } else {
+      statsLine.style.display = "none";
+      statsLine.textContent = "";
+    }
   }
 
   const values = points.map((p) => p.total_value);

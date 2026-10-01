@@ -443,6 +443,11 @@ footer { margin-top: 40px; color: var(--muted); font-size: 0.75rem; border-top: 
 .chart-legend-swatch.swatch-cost { border-top-color: var(--muted); border-top-style: dashed; border-top-width: 1.75px; }
 .chart-legend-swatch.swatch-benchmark { border-top-color: var(--accent); border-top-style: dotted; border-top-width: 1.75px; }
 
+/* Day 26 ("Benchmark overlay" follow-up: alpha/tracking error). */
+.benchmark-stats-line { font-size: 0.82rem; font-weight: 600; margin: 8px 0 0; cursor: help; }
+.benchmark-stats-line.positive { color: var(--green); }
+.benchmark-stats-line.negative { color: var(--red); }
+
 .quick-actions { display: flex; align-items: center; gap: 10px; margin: 4px 0 24px; flex-wrap: wrap; }
 .quick-actions button { font-size: 0.82rem; padding: 7px 14px; }
 .quick-actions-status { color: var(--muted); font-size: 0.82rem; }

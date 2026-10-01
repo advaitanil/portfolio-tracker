@@ -220,6 +220,12 @@
         <span class="chart-legend-item"><span class="chart-legend-swatch swatch-cost"></span>Total buy-in (cost basis)</span>
         <span class="chart-legend-item" id="benchmarkLegendItem" style="display: none"><span class="chart-legend-swatch swatch-benchmark"></span><span id="benchmarkLegendLabel">Benchmark</span></span>
       </div>
+      <!-- Day 26 ("Benchmark overlay" follow-up): real alpha/tracking-error
+           stats, not just a visual overlay — see computeAlphaTrackingError()
+           in app.js for the exact methodology and its documented
+           limitations (this is simple/excess-return alpha, not a CAPM/
+           Jensen's alpha — no beta or risk-free rate involved). -->
+      <p class="benchmark-stats-line" id="benchmarkStatsLine" style="display: none" aria-live="polite"></p>
       <p class="chart-caption" id="chartCaption">No history yet — run a backfill or check back after a few scheduled runs.</p>
       <!-- Accessible fallback for the hand-drawn SVG chart above (WCAG 1.1.1):
            the SVG conveys the same trend visually, but screen reader users
